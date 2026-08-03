@@ -52,6 +52,18 @@ app.ticker.add(() => gi.render(), null, UPDATE_PRIORITY.HIGH);
 
 Move the camera by moving `world`; call `gi.resize(w, h)` on canvas resize.
 
+Zooming works too — scale `world` — and the lighting follows it: `occluderLightRange`
+and `occluderLightHeight` are in world pixels, everything else is in the buffers
+and scales with them.
+
+The lighting is computed over the view grown by `margin` on every side — a
+fraction, `0.5` by default, so the lit region is twice the view on both axes and
+stays that way at any zoom. A torch just off-screen therefore still lights what
+you can see instead of popping in. Probes only ever sit inside the view, so the
+cascades cost the same either way; the margin costs buffer area on the world
+renders and the jump flood, and `0.5` is 4× the area of `0`. Turn it down if
+those stages hurt; `margin: 0` is the old screen-space behaviour.
+
 ### Materials
 
 `setMaterial(target, material)` applies to the whole subtree; tag a child to

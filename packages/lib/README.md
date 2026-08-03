@@ -34,7 +34,7 @@ app.stage.addChild(gi.view); // this draws the lit scene
 app.ticker.add(() => gi.render(), null, UPDATE_PRIORITY.HIGH);
 ```
 
-Move the camera by moving `world`. Resize with `gi.resize(w, h)`.
+Move the camera by moving `world`, zoom by scaling it. Resize with `gi.resize(w, h)`.
 
 ## API
 
@@ -71,11 +71,12 @@ Required: `renderer`, `world`. Everything else has a default.
 | `probeSpacing` | `2` | Cascade-0 probe spacing in lighting pixels. |
 | `cascades` | auto | Enough for the top ray to cross the diagonal. Lowering it caps how far light travels. |
 | `intervalLength` | `probeSpacing` | Cascade-0 ray length. |
+| `margin` | `0.5` | Off-view world that still emits and occludes, as a fraction of the view per side. `0` is screen-space. See below. |
 | `sky` | `0x000000` | Radiance for rays that leave the screen. |
 | `ambient` | `0x000000` | Flat light added everywhere. |
 | `occluderAmbient` | `0x000000` | Flat light for pixels that occlude. See below. |
-| `occluderLightRange` | `256` | How far an emitter's *surface* light reaches, in logical pixels. |
-| `occluderLightHeight` | `48` | Virtual z of the emitters when shading a `normalMap`. |
+| `occluderLightRange` | `256` | How far an emitter's *surface* light reaches, in world pixels. |
+| `occluderLightHeight` | `48` | Virtual z of the emitters when shading a `normalMap`, in world pixels. |
 | `occluderLightStrength` | `1` | Multiplier on the occluder surface light. `0` disables it. |
 | `strength` / `exposure` / `emissiveBoost` | `1` | Bounce light / pre-tonemap / how bright emitters draw. |
 | `toneMap` | `true` | Reinhard. |
@@ -150,7 +151,7 @@ new RadianceCascades({
     renderer, world,
     ambient: 0x0a0d14,           // everything the cascades do reach
     occluderAmbient: 0x141821,   // the floor for walls, crates, anything occluding
-    occluderLightRange: 320,     // logical px; falloff hits exactly zero here
+    occluderLightRange: 320,     // world px; falloff hits exactly zero here
     occluderLightHeight: 44,     // how far in front of the wall the lights sit
 });
 
@@ -234,8 +235,25 @@ Read this before shipping with it.
   uses colour × alpha × the `emissive` tint.
 - **The world container must not be on the stage.** Add `gi.view` instead. If
   you add both you will render the scene twice.
+- **Off-view world reaches only as far as `margin`.** The scene the rays march
+  through is the view grown by `margin` — a fraction of it, `0.5` by default, so
+  the lit region is twice the view on both axes. A light or a wall further out
+  than that contributes nothing, and rays leaving the buffers take `sky`. The
+  three world renders and the jump flood grow with the area, so `0.5` is 4x the
+  area of `0`; the cascade passes are sized by the view and do not change. Past
+  the top cascade's reach (about the view diagonal) more margin buys nothing.
+  `margin: 0` is the old screen-space behaviour.
+- **Camera zoom is a `world.scale`,** and it is read off that transform every
+  frame — no reallocation, and `margin` follows it because it is a fraction.
+  Probe spacing and ray reach are fixed in *buffer* pixels, so zooming out shows
+  more world lit at the same screen sharpness rather than the same world lit more
+  coarsely. `occluderLightRange` / `occluderLightHeight` are the two knobs in
+  world pixels, scaled by the zoom so a torch lights the same wall either way.
+  While the zoom is *changing*, the snap grid below is rescaling with it, so
+  expect the same pumping a resize gives; it settles the moment the zoom does.
 - **No sub-region / scrolling optimisation.** The lighting always covers the
-  full logical size; off-screen lights do not contribute.
+  full logical size, re-rendered from scratch every frame; nothing is cached
+  between frames even though the probe grid is world-aligned.
 - **The lighting buffers are wider than the screen.** They are rasterised
   snapped to a grid the size of the coarsest cascade's stride, because everything
   that filters them — the emissive mip pyramid above all — is aligned to the

@@ -5,8 +5,11 @@
  *  - `vUV` is 0..1 across the render target, matching PixiJS' own sprite UV
  *    orientation, so reading and writing at the same `vUV` is an identity copy.
  *  - "GI pixel space" is `vUV * uSceneSize`, the coordinate system of the
- *    emissive / occlusion / seed textures. It is the screen scaled by
- *    `RadianceCascadesOptions.resolution`.
+ *    emissive / occlusion / seed textures. It is the world scaled by
+ *    `RadianceCascadesOptions.resolution`, covering the view plus
+ *    `RadianceCascadesOptions.margin` of world on every side.
+ *  - "Probe space" is that shifted by the margin, so its origin is the top-left
+ *    of the view. Probes live there; rays march in GI pixel space.
  *  - Every fragment writes alpha 1 so the default premultiplied blend acts as a
  *    plain overwrite. Do not remove that without also disabling blending.
  */
@@ -116,6 +119,13 @@ uniform float uStride;
 /// log2(uStride), on the CPU rather than 500M times a frame in the loop below.
 uniform float uStrideMip;
 uniform float uMaxSteps;
+/**
+ * Where the probe grid starts inside the buffers, in GI pixels. The grid covers
+ * the view only; the buffers hold this much extra world on every side, which
+ * rays march through but no probe sits in. Probe space is the buffer shifted by
+ * this, and it is what the parent merge and the composite both work in.
+ */
+uniform vec2 uProbeOrigin;
 uniform float uHasParent;
 uniform float uEmissiveScale;
 uniform vec3 uSky;
@@ -163,7 +173,7 @@ void main() {
 
     for (int i = 0; i < 64; i++) {
         if (float(i) >= uMaxSteps || t >= uIntervalEnd) break;
-        vec2 p = origin + dir * t;
+        vec2 p = origin + uProbeOrigin + dir * t;
         if (p.x < 0.0 || p.y < 0.0 || p.x >= uSceneSize.x || p.y >= uSceneSize.y) { escaped = true; break; }
 
         vec2 uv = p / uSceneSize;
@@ -326,7 +336,11 @@ uniform float uSpacing;
  * buffer is shifted by this to land on the world point this fragment shows.
  */
 uniform vec2 uGiOffset;
-/// The screen, in GI pixels. Smaller than uSceneSize, which the snap pads.
+/// Where probe space starts inside the buffers -- the off-view world the rays
+/// march through. See uProbeOrigin in CASCADE_FRAG.
+uniform vec2 uMargin;
+/// The screen, in GI pixels. Smaller than uSceneSize, which the snap and the
+/// margin both pad.
 uniform vec2 uViewSize;
 uniform float uStrength;
 uniform float uExposure;
@@ -338,9 +352,9 @@ uniform vec3 uOccluderAmbient;
 uniform float uLightStrength;
 
 void main() {
-    // Where this fragment's world point sits in the lighting buffers.
+    // Where this fragment's world point sits in probe space, and in the buffers.
     vec2 p = vUV * uViewSize + uGiOffset;
-    vec2 giUV = p / uSceneSize;
+    vec2 giUV = (p + uMargin) / uSceneSize;
     vec2 probeF = p / uSpacing - 0.5;
     vec2 local = clamp(probeF, vec2(0.0), uProbeCount - 1.0) + 0.5;
 

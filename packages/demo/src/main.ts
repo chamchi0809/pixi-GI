@@ -39,6 +39,7 @@ async function main(): Promise<void> {
   let giEnabled = true;
   let showDebug = true;
   let exposure = 0.95;
+  let zoom = 1;
 
   const makeGI = (): RadianceCascades =>
     new RadianceCascades({
@@ -133,14 +134,21 @@ async function main(): Promise<void> {
       if (tapped("q")) setQuality((quality + 1) % QUALITY.length);
       if (keys.has("[")) exposure = Math.max(0.1, exposure - dt * 1.5);
       if (keys.has("]")) exposure = Math.min(4, exposure + dt * 1.5);
+      if (keys.has("-")) zoom = Math.max(0.5, zoom - dt * 1.2);
+      if (keys.has("=")) zoom = Math.min(3, zoom + dt * 1.2);
       gi.exposure = exposure;
       wasPressed = new Set(keys);
 
       const view = app.renderer.screen;
+      // Zoom lives on the GI world, which is where the lighting reads the camera
+      // from. The sand sim has no camera -- it fits itself to whatever view it is
+      // given -- so there is nothing there to zoom.
+      const scale = scene.camera ? zoom : 1;
+      world.scale.set(scale);
       const t0 = performance.now();
-      scenes[index]!.update(dt, view.width, view.height);
+      scenes[index]!.update(dt, view.width / scale, view.height / scale);
       const camera = scenes[index]!.camera;
-      if (camera) world.position.set(camera.x, camera.y);
+      if (camera) world.position.set(camera.x * scale, camera.y * scale);
       const t1 = performance.now();
       gi.resize(view.width, view.height);
       gi.render();
@@ -163,7 +171,7 @@ async function main(): Promise<void> {
       // invisible, and it would show up in any profile taken with H pressed.
       if (!showDebug) return;
       hud.text = [
-        `TAB: demo [${scene.name}]    G: global illumination [${giEnabled ? "on" : "off"}]    [ ] exposure ${exposure.toFixed(2)}    H: hide`,
+        `TAB: demo [${scene.name}]    G: global illumination [${giEnabled ? "on" : "off"}]    [ ] exposure ${exposure.toFixed(2)}    - = zoom ${scale.toFixed(2)}x    H: hide`,
         `Q: quality [${QUALITY[quality]!.name}]    ${s.cascades} cascades @ ${s.giWidth}x${s.giHeight}    ${ticker.FPS.toFixed(0)} fps`,
         ...scene.status(),
       ].join("\n");

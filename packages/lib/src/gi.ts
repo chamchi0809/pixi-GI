@@ -45,6 +45,27 @@ export interface RadianceCascadesOptions {
      * the screen; lowering it caps how far light travels.
      */
     cascades?: number;
+    /**
+     * World kept outside the view that still emits and occludes, as a **fraction
+     * of the view** on each side. The default `0.5` makes the lit region twice
+     * the view on both axes.
+     *
+     * A fraction rather than a pixel count so it follows the camera: whatever the
+     * zoom, the same proportion of extra world is lit, and the buffers never have
+     * to be reallocated for it.
+     *
+     * The probes only ever cover the view -- this widens the *scene the rays
+     * march through*, so a torch a little past the edge lights what is on screen
+     * instead of popping in once the camera reaches it, and a wall just off-screen
+     * keeps casting its shadow inwards. `0` is pure screen-space lighting.
+     *
+     * Paid for in buffer area on the three world renders and the jump flood --
+     * `0.5` is 4x the area of `0` -- while the cascade passes are sized by the
+     * view and do not notice. Past the top cascade's reach (about the view
+     * diagonal) more margin buys nothing, which is what caps this at `0.5`.
+     * @default 0.5
+     */
+    margin?: number;
     /** Cascade-0 ray length, in lighting-resolution pixels. @default probeSpacing */
     intervalLength?: number;
     /** Radiance for rays that leave the screen without hitting anything. @default 0x000000 */
@@ -68,13 +89,14 @@ export interface RadianceCascadesOptions {
      */
     occluderAmbient?: ColorSource;
     /**
-     * How far an emitter's *surface* light reaches, in logical pixels. Beyond
-     * this an occluding pixel gets only {@link RadianceCascadesOptions.occluderAmbient}.
+     * How far an emitter's *surface* light reaches, in world pixels -- logical
+     * pixels at zoom 1, and scaled with `world`'s own transform after that.
+     * Beyond it an occluding pixel gets only {@link RadianceCascadesOptions.occluderAmbient}.
      * @default 256
      */
     occluderLightRange?: number;
     /**
-     * How far in front of the scene the emitters sit, in logical pixels, when
+     * How far in front of the scene the emitters sit, in world pixels, when
      * shading a `normalMap`. Small values graze the surface and exaggerate the
      * relief; large values flatten it. Ignored without a normal map.
      * @default 48
@@ -115,9 +137,9 @@ export class RadianceCascades {
     /** Reinhard tone mapping. */
     toneMap: boolean;
 
-    /** How far an emitter's surface light reaches on occluders, in logical pixels. */
+    /** How far an emitter's surface light reaches on occluders, in world pixels. */
     occluderLightRange: number;
-    /** Virtual z of the emitters when shading a `normalMap`, in logical pixels. */
+    /** Virtual z of the emitters when shading a `normalMap`, in world pixels. */
     occluderLightHeight: number;
     /** Multiplier on the occluder surface light. `0` disables it. */
     occluderLightStrength: number;
@@ -152,6 +174,13 @@ export class RadianceCascades {
     private readonly _probeSpacing: number;
     private readonly _intervalLength: number;
     private readonly _cascadeOverride: number | undefined;
+    /** Off-view world kept in the buffers, as a fraction of the view per side. */
+    private readonly _marginFraction: number;
+    /** The same, in GI pixels, once {@link RadianceCascades.resize} knows the view. */
+    private _marginX = 0;
+    private _marginY = 0;
+    /** This frame's camera zoom, read off `world`'s transform. */
+    private _zoom = 1;
 
     /**
      * Texels the lighting buffers are snapped to. See {@link RadianceCascades.resize}.
@@ -163,7 +192,7 @@ export class RadianceCascades {
 
     private _width = 0;
     private _height = 0;
-    /** The screen, in GI pixels. The buffers are `_snapQ` bigger than this. */
+    /** The screen, in GI pixels. The buffers add `_snapQ` and two margins to this. */
     private _viewW = 0;
     private _viewH = 0;
     private _giWidth = 0;
@@ -200,6 +229,7 @@ export class RadianceCascades {
         this._probeSpacing = Math.max(1, Math.round(options.probeSpacing ?? 2));
         this._intervalLength = options.intervalLength ?? this._probeSpacing;
         this._cascadeOverride = options.cascades;
+        this._marginFraction = Math.max(0, options.margin ?? 0.5);
 
         this.strength = options.strength ?? 1;
         this.exposure = options.exposure ?? 1;
@@ -246,6 +276,7 @@ export class RadianceCascades {
                 uStride: { value: 1, type: 'f32' },
                 uStrideMip: { value: 0, type: 'f32' },
                 uMaxSteps: { value: 16, type: 'f32' },
+                uProbeOrigin: { value: f32(2), type: 'vec2<f32>' },
                 uHasParent: { value: 0, type: 'f32' },
                 uEmissiveScale: { value: 1, type: 'f32' },
                 uSky: { value: this._sky, type: 'vec3<f32>' },
@@ -277,6 +308,7 @@ export class RadianceCascades {
                     uSpacing: { value: 2, type: 'f32' },
                     uViewSize: { value: f32(2), type: 'vec2<f32>' },
                     uGiOffset: { value: f32(2), type: 'vec2<f32>' },
+                    uMargin: { value: f32(2), type: 'vec2<f32>' },
                     uStrength: { value: 1, type: 'f32' },
                     uExposure: { value: 1, type: 'f32' },
                     uEmissiveScale: { value: 1, type: 'f32' },
@@ -348,14 +380,28 @@ export class RadianceCascades {
             this._cascadeOverride,
         );
         this._snapQ = snapQuantum(probe, Math.min(this._viewW, this._viewH));
-        this._giWidth = this._viewW + this._snapQ;
-        this._giHeight = this._viewH + this._snapQ;
+        // The probe grid covers the view and its snap padding, and nothing more.
+        // The buffers then add a margin of world on every side: rays leaving a
+        // probe march through it, so off-view emitters and occluders count, but
+        // no probe is ever placed out there. That is what keeps the cascade
+        // passes -- the expensive ones -- the size they were.
+        //
+        // A whole number of texels: the margin is a constant shift of the world
+        // inside the buffers, so it never moves the probe lattice, but a
+        // fractional one would land the world half a texel off the grid the mips
+        // average over -- the very thing the snap exists to prevent.
+        const probeW = this._viewW + this._snapQ;
+        const probeH = this._viewH + this._snapQ;
+        this._marginX = Math.round(this._viewW * this._marginFraction);
+        this._marginY = Math.round(this._viewH * this._marginFraction);
+        this._giWidth = probeW + 2 * this._marginX;
+        this._giHeight = probeH + 2 * this._marginY;
 
         // Same cascade count as the screen asked for: the padding must not push
         // the hierarchy a level deeper, which would change the snap it is for.
         this._levels = buildLevels(
-            this._giWidth,
-            this._giHeight,
+            probeW,
+            probeH,
             this._probeSpacing,
             this._intervalLength,
             probe.length,
@@ -408,6 +454,7 @@ export class RadianceCascades {
         setVec2(cu['uSceneSize'], gw, gh);
         setVec2(cu['uTexSize'], cascadeW, cascadeH);
         setVec2(cu['uParentTexSize'], cascadeW, cascadeH);
+        setVec2(cu['uProbeOrigin'], this._marginX, this._marginY);
 
         this._lightPass.setTexture('uOcclusion', this._occlusion.source);
         this._lightPass.setTexture('uNormal', this._normal.source);
@@ -421,6 +468,7 @@ export class RadianceCascades {
         composite['uLight'] = this._light.source;
         const pu = composite['compositeUniforms'].uniforms;
         setVec2(pu['uSceneSize'], gw, gh);
+        setVec2(pu['uMargin'], this._marginX, this._marginY);
         setVec2(pu['uCascadeTexSize'], cascadeW, cascadeH);
         const c0 = this._levels[0]!;
         setVec2(pu['uProbeCount'], c0.probeX, c0.probeY);
@@ -449,6 +497,12 @@ export class RadianceCascades {
         world.updateLocalTransform();
         const m = this._giTransform;
         m.copyFrom(world.localTransform);
+        // Camera zoom, as the linear scale of the world transform. Everything the
+        // cascades touch is already in buffer pixels and scales with the world by
+        // itself; the occluder surface light is the exception, because its range
+        // and height are given in world units, so this is what carries the zoom
+        // over to it.
+        this._zoom = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || 1;
         const sx = this._viewW / this._width;
         const sy = this._viewH / this._height;
         m.a *= sx;
@@ -466,6 +520,12 @@ export class RadianceCascades {
         m.ty = Math.ceil(exactY / this._snapQ) * this._snapQ;
         this._residualX = m.tx - exactX;
         this._residualY = m.ty - exactY;
+        // Then push the whole world in by one margin, so buffer texel 0 is that
+        // far *outside* the view and the off-view world lands in the buffers.
+        // Probe space is what the residual is measured in, so it stays untouched
+        // and everything reading a buffer adds the margin on top.
+        m.tx += this._marginX;
+        m.ty += this._marginY;
 
         profiler?.begin('emissive');
         this._collector.apply('emissive');
@@ -603,7 +663,10 @@ export class RadianceCascades {
             this.occluderLightStrength;
         if (this.occluderLightStrength <= 0) return;
 
-        const sx = this._viewW / this._width;
+        // World units -> GI pixels: the camera zoom, then the lighting resolution.
+        // Zoomed in, a torch's surface light reaches further across the screen
+        // because it reaches the same distance across the *world*.
+        const sx = (this._viewW / this._width) * this._zoom;
         const lu = this._lightPass.resources['lightUniforms'].uniforms;
         lu['uLightRange'] = Math.max(1, this.occluderLightRange * sx);
         lu['uLightHeight'] = Math.max(0.001, this.occluderLightHeight * sx);
@@ -620,9 +683,10 @@ export class RadianceCascades {
         view.height = this._height;
         view.sx = this._viewW / this._width;
         view.sy = this._viewH / this._height;
-        view.range = this.occluderLightRange;
-        view.ox = this._residualX;
-        view.oy = this._residualY;
+        // `bounds` is already on screen, so the cull needs the range there too.
+        view.range = this.occluderLightRange * this._zoom;
+        view.ox = this._residualX + this._marginX;
+        view.oy = this._residualY + this._marginY;
 
         let n = 0;
         for (let i = 0; i < emitters.length; i++) {

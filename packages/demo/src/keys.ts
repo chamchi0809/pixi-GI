@@ -13,6 +13,8 @@ const CODES: Record<string, string> = {
     ArrowRight: 'arrowright',
     BracketLeft: '[',
     BracketRight: ']',
+    Minus: '-',
+    Equal: '=',
 };
 
 export function keyOf(e: KeyboardEvent): string {
