@@ -169,7 +169,7 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
       // intensity. This is the knob to turn if the cave reads too bright.
       setMaterial(s, {
         emissive: kind.light,
-        emissiveIntensity: 8,
+        emissiveIntensity: 12,
         occlusion: 1,
       });
       torchLayer.addChild(s);

@@ -35,7 +35,7 @@ async function main(): Promise<void> {
     { name: "sharp", resolution: 1, probeSpacing: 2 },
     { name: "fast", resolution: 0.5, probeSpacing: 2 },
   ] as const;
-  let quality = 1;
+  let quality = 2; // "fast"
   let giEnabled = true;
   let showDebug = true;
   let exposure = 0.95;
