@@ -1,0 +1,20 @@
+{
+  "name": "pixi-gi-monorepo",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=./packages/* build && pnpm --filter=demo build",
+    "dev": "pnpm --filter=demo dev",
+    "typecheck": "pnpm -r typecheck",
+    "check": "pnpm -r check"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "6.0.3",
+    "vite": "8.2.0"
+  }
+}

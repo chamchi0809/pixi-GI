@@ -1,0 +1,32 @@
+{
+  "name": "pixi-radiance",
+  "version": "0.1.0",
+  "description": "Radiance Cascades global illumination for PixiJS v8. Per-object and per-pixel emissive / occlusion.",
+  "keywords": ["pixijs", "pixi", "global-illumination", "radiance-cascades", "lighting", "2d", "webgl"],
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": ["dist", "README.md", "LICENSE"],
+  "main": "./dist/pixi-radiance.js",
+  "module": "./dist/pixi-radiance.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/pixi-radiance.js"
+    }
+  },
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "node --disable-warning=ExperimentalWarning --experimental-strip-types check.ts"
+  },
+  "peerDependencies": {
+    "pixi.js": "^8.6.0"
+  },
+  "devDependencies": {
+    "pixi.js": "8.19.0",
+    "typescript": "6.0.3",
+    "vite": "8.2.0"
+  }
+}
