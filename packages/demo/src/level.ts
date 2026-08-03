@@ -1,5 +1,5 @@
 import { Container, Sprite, Texture } from 'pixi.js';
-import { setMaterial } from 'pixi-radiance';
+import { setMaterial } from 'pixi-rcgi';
 
 export const TILE = 70;
 

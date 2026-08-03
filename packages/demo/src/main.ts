@@ -1,5 +1,5 @@
 import { Application, Container, Text, UPDATE_PRIORITY } from "pixi.js";
-import { GpuProfiler, RadianceCascades } from "pixi-radiance";
+import { GpuProfiler, RadianceCascades } from "pixi-rcgi";
 import { keyOf } from "./keys";
 import { createPlatformerScene } from "./platformer";
 import { createSandScene } from "./sand/scene";

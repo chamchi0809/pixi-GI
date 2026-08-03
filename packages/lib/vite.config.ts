@@ -6,7 +6,7 @@ export default defineConfig({
     lib: {
       entry: 'src/index.ts',
       formats: ['es'],
-      fileName: 'pixi-radiance',
+      fileName: 'pixi-rcgi',
     },
     rollupOptions: { external: ['pixi.js'] },
     sourcemap: true,

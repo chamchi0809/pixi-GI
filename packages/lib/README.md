@@ -1,4 +1,4 @@
-# pixi-radiance
+# pixi-rcgi
 
 Vanilla **radiance cascades** global illumination for [PixiJS](https://pixijs.com) v8.
 
@@ -8,14 +8,14 @@ per pixel with a map. Everything you do not tag is background: it gets lit, but
 casts no shadow and emits nothing.
 
 ```bash
-npm i pixi-radiance   # peer dep: pixi.js ^8.6.0
+npm i pixi-rcgi   # peer dep: pixi.js ^8.6.0
 ```
 
 ## Use
 
 ```ts
 import { Application, Container } from 'pixi.js';
-import { RadianceCascades, setMaterial } from 'pixi-radiance';
+import { RadianceCascades, setMaterial } from 'pixi-rcgi';
 
 const app = new Application();
 await app.init({ preference: 'webgl' }); // WebGL only — see Limitations

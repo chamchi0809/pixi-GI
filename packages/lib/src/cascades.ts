@@ -1,6 +1,6 @@
 /**
  * The cascade hierarchy: pure arithmetic, no PixiJS. Kept separate so it can be
- * checked without a GPU (`pnpm --filter pixi-radiance check`).
+ * checked without a GPU (`pnpm --filter pixi-rcgi check`).
  */
 
 /** @internal One level of the hierarchy, in lighting-resolution pixels. */

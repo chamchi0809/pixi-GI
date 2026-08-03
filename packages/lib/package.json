@@ -1,5 +1,5 @@
 {
-  "name": "pixi-radiance",
+  "name": "pixi-rcgi",
   "version": "0.1.0",
   "description": "Radiance Cascades global illumination for PixiJS v8. Per-object and per-pixel emissive / occlusion.",
   "keywords": ["pixijs", "pixi", "global-illumination", "radiance-cascades", "lighting", "2d", "webgl"],
@@ -7,13 +7,13 @@
   "type": "module",
   "sideEffects": false,
   "files": ["dist", "README.md", "LICENSE"],
-  "main": "./dist/pixi-radiance.js",
-  "module": "./dist/pixi-radiance.js",
+  "main": "./dist/pixi-rcgi.js",
+  "module": "./dist/pixi-rcgi.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/pixi-radiance.js"
+      "import": "./dist/pixi-rcgi.js"
     }
   },
   "scripts": {

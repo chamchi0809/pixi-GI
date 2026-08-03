@@ -1,6 +1,6 @@
 /**
  * The one runnable check: the cascade hierarchy is the only part of the library
- * that is pure logic rather than GPU output. `pnpm --filter pixi-radiance check`
+ * that is pure logic rather than GPU output. `pnpm --filter pixi-rcgi check`
  */
 import assert from 'node:assert/strict';
 import { buildLevels, cascadeTextureSize } from './src/cascades.ts';

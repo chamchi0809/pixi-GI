@@ -11,7 +11,7 @@
     "check": "node --disable-warning=ExperimentalWarning --experimental-strip-types check.ts"
   },
   "dependencies": {
-    "pixi-radiance": "workspace:*",
+    "pixi-rcgi": "workspace:*",
     "pixi.js": "8.19.0"
   },
   "devDependencies": {

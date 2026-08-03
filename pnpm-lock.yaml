@@ -18,11 +18,11 @@ importers:
         specifier: 8.2.0
         version: 8.2.0(@types/node@26.1.2)
 
-  apps/demo:
+  packages/demo:
     dependencies:
-      pixi-radiance:
+      pixi-rcgi:
         specifier: workspace:*
-        version: link:../../packages/pixi-radiance
+        version: link:../../packages/lib
       pixi.js:
         specifier: 8.19.0
         version: 8.19.0
@@ -34,7 +34,7 @@ importers:
         specifier: 8.2.0
         version: 8.2.0(@types/node@26.1.2)
 
-  packages/pixi-radiance:
+  packages/lib:
     devDependencies:
       pixi.js:
         specifier: 8.19.0

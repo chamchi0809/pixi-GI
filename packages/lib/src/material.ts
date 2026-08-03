@@ -77,7 +77,7 @@ export interface ResolvedMaterial {
     readonly normalMap: Texture | undefined;
 }
 
-const MATERIAL = Symbol.for('pixi-radiance.material');
+const MATERIAL = Symbol.for('pixi-rcgi.material');
 
 interface Tagged {
     [MATERIAL]?: ResolvedMaterial;

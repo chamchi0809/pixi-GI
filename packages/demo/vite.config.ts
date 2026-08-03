@@ -6,8 +6,8 @@ export default defineConfig({
   // Use the library source directly so `pnpm dev` hot-reloads library edits.
   resolve: {
     alias: {
-      "pixi-radiance": new URL(
-        "../../packages/pixi-radiance/src/index.ts",
+      "pixi-rcgi": new URL(
+        "../../packages/lib/src/index.ts",
         import.meta.url,
       ).pathname,
     },

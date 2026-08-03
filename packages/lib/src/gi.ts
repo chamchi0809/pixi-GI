@@ -645,12 +645,12 @@ function assertWebGLFloat(renderer: Renderer): void {
     const gl = (renderer as WebGLRenderer).gl as WebGL2RenderingContext | undefined;
     if (!gl) {
         throw new Error(
-            'pixi-radiance requires the WebGL renderer. Create your app with `preference: "webgl"`.',
+            'pixi-rcgi requires the WebGL renderer. Create your app with `preference: "webgl"`.',
         );
     }
     if (!gl.getExtension('EXT_color_buffer_float')) {
         throw new Error(
-            'pixi-radiance requires the WebGL2 EXT_color_buffer_float extension, which this device does not expose.',
+            'pixi-rcgi requires the WebGL2 EXT_color_buffer_float extension, which this device does not expose.',
         );
     }
 }

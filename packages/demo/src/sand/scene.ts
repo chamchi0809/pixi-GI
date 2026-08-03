@@ -1,5 +1,5 @@
 import { Container, Sprite, Texture } from "pixi.js";
-import { setMaterial } from "pixi-radiance";
+import { setMaterial } from "pixi-rcgi";
 import type { Scene } from "../scene";
 import { keyOf } from "../keys";
 import { buffer, clamp8, pixelTexture } from "./pixels";

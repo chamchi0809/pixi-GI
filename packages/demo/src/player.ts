@@ -1,6 +1,6 @@
 import { AnimatedSprite, Container, Sprite } from 'pixi.js';
 import type { Texture } from 'pixi.js';
-import { setMaterial } from 'pixi-radiance';
+import { setMaterial } from 'pixi-rcgi';
 import { TILE, type Level } from './level';
 
 const WIDTH = 46;

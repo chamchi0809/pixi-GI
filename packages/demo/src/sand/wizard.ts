@@ -1,5 +1,5 @@
 import { Container, Sprite } from 'pixi.js';
-import { setMaterial } from 'pixi-radiance';
+import { setMaterial } from 'pixi-rcgi';
 import { pixelTexture } from './pixels';
 import { FIRE, Sim } from './sim';
 
