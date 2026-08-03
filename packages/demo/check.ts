@@ -3,8 +3,11 @@
  * that is pure logic rather than pixels on a screen. `pnpm --filter demo check`
  */
 import assert from 'node:assert/strict';
+import { Texture } from 'pixi.js';
 import { EMBER, EMPTY, FIRE, LAVA, MOSS, SAND, STEAM, STONE, Sim, WATER, WOOD, generate } from './src/sand/sim.ts';
 import { keyOf } from './src/keys.ts';
+import { TILE } from './src/level.ts';
+import { Player } from './src/player.ts';
 
 // --- the keyboard reads physical keys, so an active IME cannot break it -------
 {
@@ -143,4 +146,52 @@ const run = (sim: Sim, steps: number): Sim => {
     assert.ok(worst < peak * 0.35, `the flame thins out over many frames (worst frame lost ${worst}/${peak})`);
 }
 
-console.log('sand sim ok');
+// --- the platformer's movement rules ------------------------------------------
+// Also logic rather than pixels, and the walk cycle used to hide a bug: it ran
+// on Ticker.shared, so it animated even standing still, which masked `onGround`
+// flickering off every other frame while walking.
+{
+    const level = { spawnX: 100, spawnY: 10 * TILE, isSolid: (_c: number, r: number) => r >= 10 } as never;
+    const frames = Array.from({ length: 11 }, () => Texture.EMPTY);
+    const player = new Player(level, {
+        stand: Texture.EMPTY,
+        jump: Texture.EMPTY,
+        duck: Texture.EMPTY,
+        walk: frames,
+    });
+    const idle = { left: false, right: false, down: false, jump: false };
+    const walking = { ...idle, right: true };
+    const anim = player['_walk'] as { currentFrame: number };
+
+    /** Steps the sim for `seconds` and counts the walk frames that went by. */
+    const step = (input: typeof idle, seconds: number): number => {
+        let steps = 0;
+        for (let i = 0; i < Math.round(seconds * 60); i++) {
+            const before = anim.currentFrame;
+            player.update(1 / 60, input);
+            if (anim.currentFrame !== before) steps++;
+        }
+        return steps;
+    };
+
+    step(idle, 1);
+    assert.ok(player.onGround, 'the player lands on the floor');
+    assert.equal(step(idle, 2), 0, 'the walk cycle does not advance while standing still');
+    const stepped = step(walking, 2);
+    assert.ok(stepped >= 11 && stepped <= 13, `the walk cycle runs at ~6fps (${stepped} frames in 2s)`);
+    assert.equal(step({ ...walking, down: true }, 2), 0, 'ducking is not walking');
+
+    player.update(1 / 60, { ...idle, jump: true });
+    assert.ok(player.vy < 0, 'the ground jump fires');
+    assert.ok(player.vy ** 2 / (2 * 2600) > 200, `and clears more than 200px (${player.vy.toFixed(0)}/s)`);
+    step(idle, 0.2);
+    assert.ok(player.vy < 0, 'letting go of the key does not cut the jump short');
+    player.update(1 / 60, { ...idle, jump: true });
+    assert.ok(player.vy < 0, 'the air jump fires');
+    step(idle, 0.2);
+    const falling = player.vy;
+    player.update(1 / 60, { ...idle, jump: true });
+    assert.ok(player.vy > falling, 'but a third jump does nothing');
+}
+
+console.log('sand sim + platformer ok');

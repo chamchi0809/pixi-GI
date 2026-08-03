@@ -110,7 +110,7 @@ export async function createPlatformerScene(): Promise<Scene> {
             scene.camera!.x = clamp(width / 2 - player.view.x, Math.min(0, width - LEVEL_WIDTH), 0);
             scene.camera!.y = clamp(height / 2 - player.view.y, Math.min(0, height - LEVEL_HEIGHT), 0);
         },
-        status: () => ['move: A/D or ←/→    jump: space/W    duck: S'],
+        status: () => ['move: A/D or ←/→    jump/double jump: space/W    duck: S'],
     };
     return scene;
 }
