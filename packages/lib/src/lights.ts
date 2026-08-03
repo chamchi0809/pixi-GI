@@ -35,6 +35,16 @@ export interface LightView {
     sx: number;
     sy: number;
     range: number;
+    /**
+     * GI-pixel offset added to every light, so the emitters land on the grid the
+     * occlusion and normal buffers were rasterised on. Those are snapped to a
+     * coarse grid while `bounds` comes from the exact camera, and without this a
+     * light would slide against the very surface it shades -- which near an
+     * emitter, where the falloff and the normal term are steepest, is the
+     * difference the flicker is made of.
+     */
+    ox: number;
+    oy: number;
 }
 
 /**
@@ -58,8 +68,8 @@ export function packLight(
 
     const o = slot * LIGHT_FLOATS;
     const radius = Math.max(Math.max((maxX - minX) * view.sx, (maxY - minY) * view.sy) * 0.5, 0.5);
-    out[o] = ((minX + maxX) * 0.5) * view.sx;
-    out[o + 1] = ((minY + maxY) * 0.5) * view.sy;
+    out[o] = ((minX + maxX) * 0.5) * view.sx + view.ox;
+    out[o + 1] = ((minY + maxY) * 0.5) * view.sy + view.oy;
     out[o + 2] = radius;
     out[o + 3] = 0;
 

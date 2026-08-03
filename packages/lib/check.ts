@@ -3,7 +3,7 @@
  * that is pure logic rather than GPU output. `pnpm --filter pixi-rcgi check`
  */
 import assert from 'node:assert/strict';
-import { buildLevels, cascadeTextureSize } from './src/cascades.ts';
+import { buildLevels, cascadeTextureSize, snapQuantum } from './src/cascades.ts';
 import { LIGHT_FLOATS, packLight } from './src/lights.ts';
 
 for (const [w, h] of [
@@ -61,6 +61,39 @@ for (const [w, h] of [
     }
 }
 
+// --- the snap grid -----------------------------------------------------------
+// Every filter over the lighting buffers is aligned to the buffers, so they are
+// rasterised on this grid to stop those filters sliding as the camera moves.
+{
+    for (const [w, h] of [
+        [640, 360],
+        [1920, 1080],
+        [100, 100],
+    ] as const) {
+        for (const spacing of [1, 2, 3, 4]) {
+            const levels = buildLevels(w, h, spacing, spacing);
+            const q = snapQuantum(levels, Math.min(w, h));
+            const label = `${w}x${h} @ spacing ${spacing}`;
+
+            for (const level of levels) {
+                if (level.spacing > Math.min(w, h)) continue;
+                // Both grids the level filters on have to divide the snap, or that
+                // level slides anyway: its probe lattice and its mip cell, which
+                // is the next power of two at or above its stride.
+                assert.equal(q % level.spacing, 0, `${label}: snap ${q} holds level spacing ${level.spacing}`);
+                const cell = 2 ** Math.ceil(Math.log2(level.stride));
+                assert.equal(q % cell, 0, `${label}: snap ${q} holds mip cell ${cell}`);
+            }
+            // The buffers are padded by the snap, so it must stay a fraction of
+            // them rather than a multiple.
+            assert.ok(q <= Math.min(w, h), `${label}: snap ${q} fits the buffer`);
+        }
+    }
+    // A cascade coarser than the buffer is skipped rather than snapped to.
+    assert.equal(snapQuantum(buildLevels(640, 360, 2, 2, 10), 360), 256);
+    assert.equal(snapQuantum(buildLevels(640, 360, 2, 2, 1), 360), 2);
+}
+
 // An explicit cascade count is honoured and clamped to something renderable.
 assert.equal(buildLevels(640, 360, 2, 2, 3).length, 3);
 assert.equal(buildLevels(640, 360, 2, 2, 0).length, 1);
@@ -70,7 +103,7 @@ assert.equal(buildLevels(640, 360, 2, 2, 99).length, 10);
 {
     const out = new Float32Array(4 * LIGHT_FLOATS);
     // Half-resolution lighting on an 800x600 screen, 100px of falloff.
-    const view = { width: 800, height: 600, sx: 0.5, sy: 0.5, range: 100 };
+    const view = { width: 800, height: 600, sx: 0.5, sy: 0.5, range: 100, ox: 0, oy: 0 };
     const orange = { r: 255, g: 128, b: 0, intensity: 2, occlusion: 1 };
     const box = { minX: 100, minY: 100, maxX: 140, maxY: 180 };
 
@@ -87,6 +120,12 @@ assert.equal(buildLevels(640, 360, 2, 2, 99).length, 10);
     packLight(box, { ...orange, occlusion: 0.5 }, view, 0, out);
     assert.equal(out[4], 2 * 20.5, 'a partial occluder lands between the two');
 
+    // The GI buffers are rasterised on a coarse grid, so lights are shifted onto
+    // it too -- position only, never the falloff radius.
+    packLight(box, orange, { ...view, ox: -0.5, oy: 0.25 }, 0, out);
+    assert.deepEqual([...out.subarray(0, 3)], [59.5, 70.25, 20], 'the grid offset moves the light');
+    packLight(box, orange, view, 0, out);
+
     // Slots are LIGHT_FLOATS apart and do not tread on each other.
     assert.ok(packLight({ ...box, minX: 300, maxX: 340 }, orange, view, 2, out));
     assert.equal(out[2 * LIGHT_FLOATS], 160, 'slot 2 starts at its own offset');
@@ -102,4 +141,5 @@ assert.equal(buildLevels(640, 360, 2, 2, 99).length, 10);
 }
 
 console.log('cascade hierarchy ok');
+console.log('snap grid ok');
 console.log('occluder light packing ok');

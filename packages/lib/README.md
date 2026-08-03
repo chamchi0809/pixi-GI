@@ -236,6 +236,16 @@ Read this before shipping with it.
   you add both you will render the scene twice.
 - **No sub-region / scrolling optimisation.** The lighting always covers the
   full logical size; off-screen lights do not contribute.
+- **The lighting buffers are wider than the screen.** They are rasterised
+  snapped to a grid the size of the coarsest cascade's stride, because everything
+  that filters them — the emissive mip pyramid above all — is aligned to the
+  buffer rather than to the world, and a camera that slides across those cells
+  pumps the light. Snapping pins them to fixed world positions; the padding is
+  what keeps every visible pixel inside a buffer the snap has pushed off-screen.
+  Costs about 15-30% of the lighting passes, and the picture still moves at
+  sub-pixel precision — only the lighting *grid* is quantised.
+  Read the camera from `world`'s own transform, so move it there and not on a
+  child, or the snap has nothing to snap and the flicker comes back.
 
 ## Check
 

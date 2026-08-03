@@ -3,7 +3,7 @@ import type { ColorSource, Container, Renderer, WebGLRenderer } from 'pixi.js';
 import { LightPass, Pass } from './pass';
 import { SceneCollector } from './material';
 import { CASCADE_FRAG, COMPOSITE_FRAG, JFA_FRAG, SEED_FRAG, VERTEX } from './shaders';
-import { buildLevels, cascadeTextureSize } from './cascades';
+import { buildLevels, cascadeTextureSize, snapQuantum } from './cascades';
 import type { CascadeLevel } from './cascades';
 import { packLight } from './lights';
 import type { LightView } from './lights';
@@ -145,7 +145,7 @@ export class RadianceCascades {
     private readonly _sky = f32(3);
     private readonly _ambient = f32(3);
     private readonly _occluderAmbient = f32(3);
-    private readonly _lightView: LightView = { width: 0, height: 0, sx: 1, sy: 1, range: 0 };
+    private readonly _lightView: LightView = { width: 0, height: 0, sx: 1, sy: 1, range: 0, ox: 0, oy: 0 };
     private _background: number[] = [0, 0, 0, 1];
 
     private readonly _resolution: number;
@@ -153,8 +153,19 @@ export class RadianceCascades {
     private readonly _intervalLength: number;
     private readonly _cascadeOverride: number | undefined;
 
+    /**
+     * Texels the lighting buffers are snapped to. See {@link RadianceCascades.resize}.
+     */
+    private _snapQ = 1;
+    /** What this frame's snap pushed the buffers by, in GI pixels. `[0, _snapQ)`. */
+    private _residualX = 0;
+    private _residualY = 0;
+
     private _width = 0;
     private _height = 0;
+    /** The screen, in GI pixels. The buffers are `_snapQ` bigger than this. */
+    private _viewW = 0;
+    private _viewH = 0;
     private _giWidth = 0;
     private _giHeight = 0;
     private _levels: CascadeLevel[] = [];
@@ -264,6 +275,8 @@ export class RadianceCascades {
                     uCascadeTexSize: { value: f32(2), type: 'vec2<f32>' },
                     uProbeCount: { value: f32(2), type: 'vec2<f32>' },
                     uSpacing: { value: 2, type: 'f32' },
+                    uViewSize: { value: f32(2), type: 'vec2<f32>' },
+                    uGiOffset: { value: f32(2), type: 'vec2<f32>' },
                     uStrength: { value: 1, type: 'f32' },
                     uExposure: { value: 1, type: 'f32' },
                     uEmissiveScale: { value: 1, type: 'f32' },
@@ -313,15 +326,39 @@ export class RadianceCascades {
         if (width === this._width && height === this._height) return;
         this._width = Math.max(1, Math.round(width));
         this._height = Math.max(1, Math.round(height));
-        this._giWidth = Math.max(1, Math.round(this._width * this._resolution));
-        this._giHeight = Math.max(1, Math.round(this._height * this._resolution));
+        this._viewW = Math.max(1, Math.round(this._width * this._resolution));
+        this._viewH = Math.max(1, Math.round(this._height * this._resolution));
 
+        // Everything that filters the lighting buffers is aligned to *them*, not
+        // to the world: the emissive mip pyramid above all, whose coarsest level
+        // averages over a whole top-cascade stride. Rasterise the world at a
+        // fractional -- or even a whole-texel -- offset and a torch slides across
+        // those cells as the camera moves, which pumps the light over half the
+        // screen. Snapping the buffers to a multiple of the coarsest stride pins
+        // every one of those filters to fixed world positions instead.
+        //
+        // The buffers pay for it in size: they are `snapQ` wider and taller than
+        // the screen, because the snap leaves them offset from it by up to that
+        // much and the composite still has to find every visible pixel inside.
+        const probe = buildLevels(
+            this._viewW,
+            this._viewH,
+            this._probeSpacing,
+            this._intervalLength,
+            this._cascadeOverride,
+        );
+        this._snapQ = snapQuantum(probe, Math.min(this._viewW, this._viewH));
+        this._giWidth = this._viewW + this._snapQ;
+        this._giHeight = this._viewH + this._snapQ;
+
+        // Same cascade count as the screen asked for: the padding must not push
+        // the hierarchy a level deeper, which would change the snap it is for.
         this._levels = buildLevels(
             this._giWidth,
             this._giHeight,
             this._probeSpacing,
             this._intervalLength,
-            this._cascadeOverride,
+            probe.length,
         );
 
         const { width: cascadeW, height: cascadeH } = cascadeTextureSize(this._levels);
@@ -377,6 +414,7 @@ export class RadianceCascades {
         setVec2(this._lightPass.resources['lightUniforms'].uniforms['uSceneSize'], gw, gh);
 
         const composite = this.view.shader!.resources;
+        setVec2(composite['compositeUniforms'].uniforms['uViewSize'], this._viewW, this._viewH);
         composite['uAlbedo'] = this._albedo.source;
         composite['uEmissive'] = this._emissive.source;
         composite['uOcclusion'] = this._occlusion.source;
@@ -411,14 +449,23 @@ export class RadianceCascades {
         world.updateLocalTransform();
         const m = this._giTransform;
         m.copyFrom(world.localTransform);
-        const sx = this._giWidth / this._width;
-        const sy = this._giHeight / this._height;
+        const sx = this._viewW / this._width;
+        const sy = this._viewH / this._height;
         m.a *= sx;
         m.c *= sx;
-        m.tx *= sx;
         m.b *= sy;
         m.d *= sy;
-        m.ty *= sy;
+        // Onto the snap grid, rounding up so the screen lands inside the buffers
+        // and the padding sits past their far edge. Everything that reads them
+        // has to follow, or the fix trades one flicker for another: `_residual`
+        // is how far the snap pushed them, and both the light pass and the
+        // composite add it back.
+        const exactX = m.tx * sx;
+        const exactY = m.ty * sy;
+        m.tx = Math.ceil(exactX / this._snapQ) * this._snapQ;
+        m.ty = Math.ceil(exactY / this._snapQ) * this._snapQ;
+        this._residualX = m.tx - exactX;
+        this._residualY = m.ty - exactY;
 
         profiler?.begin('emissive');
         this._collector.apply('emissive');
@@ -535,6 +582,7 @@ export class RadianceCascades {
         const composite = this.view.shader!.resources;
         composite['uCascade0'] = read.source;
         const pu = composite['compositeUniforms'].uniforms;
+        setVec2(pu['uGiOffset'], this._residualX, this._residualY);
         pu['uStrength'] = this.strength;
         pu['uExposure'] = this.exposure;
         pu['uEmissiveBoost'] = this.emissiveBoost;
@@ -555,7 +603,7 @@ export class RadianceCascades {
             this.occluderLightStrength;
         if (this.occluderLightStrength <= 0) return;
 
-        const sx = this._giWidth / this._width;
+        const sx = this._viewW / this._width;
         const lu = this._lightPass.resources['lightUniforms'].uniforms;
         lu['uLightRange'] = Math.max(1, this.occluderLightRange * sx);
         lu['uLightHeight'] = Math.max(0.001, this.occluderLightHeight * sx);
@@ -570,9 +618,11 @@ export class RadianceCascades {
         const view = this._lightView;
         view.width = this._width;
         view.height = this._height;
-        view.sx = this._giWidth / this._width;
-        view.sy = this._giHeight / this._height;
+        view.sx = this._viewW / this._width;
+        view.sy = this._viewH / this._height;
         view.range = this.occluderLightRange;
+        view.ox = this._residualX;
+        view.oy = this._residualY;
 
         let n = 0;
         for (let i = 0; i < emitters.length; i++) {

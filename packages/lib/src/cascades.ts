@@ -63,6 +63,30 @@ export function buildLevels(
     return levels;
 }
 
+/**
+ * @internal
+ * Texels the lighting buffers must be rasterised on to keep everything that
+ * filters them -- the emissive mip pyramid above all -- landing on fixed world
+ * positions rather than sliding with the camera.
+ *
+ * That is the coarsest level's stride, which is both its probe spacing and the
+ * mip cell it averages over; the two only differ when `probeSpacing` is not a
+ * power of two, and then the snap has to be a multiple of both. Levels coarser
+ * than `fit` are skipped: they barely vary across the screen, and the buffers are
+ * padded by the snap, so snapping to one would cost more than the whole buffer --
+ * which an explicit `cascades: 10` would otherwise do.
+ */
+export function snapQuantum(levels: CascadeLevel[], fit: number): number {
+    let top = levels[0]!;
+    for (const level of levels) if (level.spacing <= fit) top = level;
+    const cell = 2 ** Math.ceil(Math.log2(top.stride));
+    return (top.spacing * cell) / gcd(top.spacing, cell);
+}
+
+function gcd(a: number, b: number): number {
+    return b ? gcd(b, a % b) : a;
+}
+
 /** @internal Size of the cascade render targets: the largest level decides. */
 export function cascadeTextureSize(levels: CascadeLevel[]): { width: number; height: number } {
     let width = 1;

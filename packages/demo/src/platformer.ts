@@ -1,4 +1,4 @@
-import { Assets, Container, type Texture } from 'pixi.js';
+import { Assets, type Texture } from 'pixi.js';
 import type { Scene } from './scene';
 import { keyOf } from './keys';
 import { buildLevel, LEVEL_HEIGHT, LEVEL_WIDTH, type LevelTextures } from './level';
@@ -61,10 +61,6 @@ export async function createPlatformerScene(): Promise<Scene> {
     });
     level.root.addChild(player.view);
 
-    // The level scrolls by moving its own root; `main` keeps the GI world at 0,0.
-    const root = new Container();
-    root.addChild(level.root);
-
     const keys = new Set<string>();
     const input: Input = { left: false, right: false, down: false, jump: false };
     const sync = (): void => {
@@ -94,8 +90,10 @@ export async function createPlatformerScene(): Promise<Scene> {
 
     const scene: Scene = {
         name: 'platformer',
-        root,
+        // The level scrolls by `scene.camera`, which `main` puts on the GI world.
+        root: level.root,
         active: false,
+        camera: { x: 0, y: 0 },
         lighting: {
             ambient: 0x0a0d14,
             ambientOff: 0xb4bcc8,
@@ -109,8 +107,8 @@ export async function createPlatformerScene(): Promise<Scene> {
         update(dt, width, height) {
             if (!scene.active) clear();
             player.update(dt, input);
-            level.root.x = clamp(width / 2 - player.view.x, Math.min(0, width - LEVEL_WIDTH), 0);
-            level.root.y = clamp(height / 2 - player.view.y, Math.min(0, height - LEVEL_HEIGHT), 0);
+            scene.camera!.x = clamp(width / 2 - player.view.x, Math.min(0, width - LEVEL_WIDTH), 0);
+            scene.camera!.y = clamp(height / 2 - player.view.y, Math.min(0, height - LEVEL_HEIGHT), 0);
         },
         status: () => ['move: A/D or ←/→    jump: space/W    duck: S'],
     };

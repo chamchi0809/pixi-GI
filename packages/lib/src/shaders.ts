@@ -319,6 +319,15 @@ uniform vec2 uSceneSize;
 uniform vec2 uCascadeTexSize;
 uniform vec2 uProbeCount;
 uniform float uSpacing;
+/**
+ * GI pixels the lighting buffers are offset from the albedo: they are rasterised
+ * snapped to a coarse grid, so that everything filtering them stays put in the
+ * world, while the albedo uses the exact camera. Every lookup into a lighting
+ * buffer is shifted by this to land on the world point this fragment shows.
+ */
+uniform vec2 uGiOffset;
+/// The screen, in GI pixels. Smaller than uSceneSize, which the snap pads.
+uniform vec2 uViewSize;
 uniform float uStrength;
 uniform float uExposure;
 uniform float uEmissiveScale;
@@ -329,7 +338,10 @@ uniform vec3 uOccluderAmbient;
 uniform float uLightStrength;
 
 void main() {
-    vec2 probeF = (vUV * uSceneSize) / uSpacing - 0.5;
+    // Where this fragment's world point sits in the lighting buffers.
+    vec2 p = vUV * uViewSize + uGiOffset;
+    vec2 giUV = p / uSceneSize;
+    vec2 probeF = p / uSpacing - 0.5;
     vec2 local = clamp(probeF, vec2(0.0), uProbeCount - 1.0) + 0.5;
 
     vec3 irradiance = vec3(0.0);
@@ -340,13 +352,13 @@ void main() {
     irradiance *= 0.25;
 
     vec4 albedo = texture(uAlbedo, vUV);
-    vec3 emissive = texture(uEmissive, vUV).rgb * uEmissiveScale * uEmissiveBoost;
+    vec3 emissive = texture(uEmissive, giUV).rgb * uEmissiveScale * uEmissiveBoost;
 
     // Occluding pixels get the surface light instead of the cascades, in
     // proportion to how much they occlude, so a half-transparent caster gets
     // half of each model.
-    float occ = texture(uOcclusion, vUV).a;
-    vec3 surface = uOccluderAmbient + texture(uLight, vUV).rgb * uLightStrength;
+    float occ = texture(uOcclusion, giUV).a;
+    vec3 surface = uOccluderAmbient + texture(uLight, giUV).rgb * uLightStrength;
     vec3 ambient = mix(uAmbient, surface, occ);
 
     vec3 color = albedo.rgb * (irradiance * uStrength + ambient) + emissive;

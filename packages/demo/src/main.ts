@@ -66,6 +66,7 @@ async function main(): Promise<void> {
     scene.active = true;
     world.removeChildren();
     world.addChild(scene.root);
+    world.position.set(0, 0);
 
     // Walls are outside the cascades, so they get their own model: a dark
     // floor plus direct falloff from every emitter. Each scene wants its own.
@@ -138,6 +139,8 @@ async function main(): Promise<void> {
       const view = app.renderer.screen;
       const t0 = performance.now();
       scenes[index]!.update(dt, view.width, view.height);
+      const camera = scenes[index]!.camera;
+      if (camera) world.position.set(camera.x, camera.y);
       const t1 = performance.now();
       gi.resize(view.width, view.height);
       gi.render();
