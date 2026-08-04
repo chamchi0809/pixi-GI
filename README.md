@@ -1,6 +1,6 @@
 # pixi-rcgi
 
-Radiance-cascades global illumination for [PixiJS](https://pixijs.com) v8.
+Holographic-radiance-cascades global illumination for [PixiJS](https://pixijs.com) v8.
 
 ![sand demo](docs/sand.png)
 
@@ -56,13 +56,12 @@ Zooming works too — scale `world` — and the lighting follows it: `occluderLi
 and `occluderLightHeight` are in world pixels, everything else is in the buffers
 and scales with them.
 
-The lighting is computed over the view grown by `margin` on every side — a
-fraction, `0.5` by default, so the lit region is twice the view on both axes and
-stays that way at any zoom. A torch just off-screen therefore still lights what
-you can see instead of popping in. Probes only ever sit inside the view, so the
-cascades cost the same either way; the margin costs buffer area on the world
-renders and the jump flood, and `0.5` is 4× the area of `0`. Turn it down if
-those stages hurt; `margin: 0` is the old screen-space behaviour.
+The lighting is computed over the view grown by `margin` on every side, so a
+torch just off-screen still lights what you can see instead of popping in. It is
+free: the buffers are square powers of two and the margin is the slack that
+rounding already paid for, which is also why asking for more than fits is
+clamped. On 16:9 there is a lot of it above and below and very little either
+side.
 
 ### Materials
 
@@ -82,20 +81,23 @@ Intensity is radiance _per lighting pixel a ray crosses_, so a wide
 ### Sharpness
 
 ```ts
-new RadianceCascades({ renderer, world, resolution: 1, probeSpacing: 1 });
+new RadianceCascades({ renderer, world, resolution: 1 });
 ```
 
-Irradiance is sampled every `probeSpacing / resolution` screen pixels — 4px at
-the defaults, which reads as blur. `1`/`1` is pixel-crisp for ~1.5× the cost.
-Both are fixed at construction.
-[Measurements](packages/lib/README.md#sharpness-resolution-x-probespacing).
+HRC probes every lighting pixel, so `resolution` is the only knob: it sets the
+sharpness and the price together, and `1` is pixel-crisp. It is fixed at
+construction, and each step up costs 4× the pixels, 4× the memory and one more
+cascade. [Measurements](packages/lib/README.md#cost-and-sharpness-resolution).
 
 The [reference](packages/lib/README.md#limitations) has the full list and the
 reasoning behind each one.
 
 ## Credits
 
-Radiance cascades is Alexander Sannikov's technique.
+Radiance cascades is Alexander Sannikov's technique. The holographic variant is
+[Yaazarai's](https://github.com/Yaazarai/Volumetric-HRC), after
+[arXiv:2505.02041](https://arxiv.org/abs/2505.02041); this is a port of its
+ray-extension implementation to PixiJS.
 
 Platformer art:
 [Platformer Art Complete Pack](https://kenney.nl/assets/platformer-art-complete-pack-now-with-enemies)

@@ -1,17 +1,22 @@
 /**
- * All GLSL for the radiance-cascade pipeline.
+ * All GLSL for the holographic-radiance-cascade pipeline.
  *
  * Conventions shared by every pass:
  *  - `vUV` is 0..1 across the render target, matching PixiJS' own sprite UV
  *    orientation, so reading and writing at the same `vUV` is an identity copy.
- *  - "GI pixel space" is `vUV * uSceneSize`, the coordinate system of the
- *    emissive / occlusion / seed textures. It is the world scaled by
+ *  - "GI pixel space" is the coordinate system of the emissive / occlusion
+ *    buffers: a square `uExtent x uExtent` image of the world scaled by
  *    `RadianceCascadesOptions.resolution`, covering the view plus
  *    `RadianceCascadesOptions.margin` of world on every side.
- *  - "Probe space" is that shifted by the margin, so its origin is the top-left
- *    of the view. Probes live there; rays march in GI pixel space.
- *  - Every fragment writes alpha 1 so the default premultiplied blend acts as a
- *    plain overwrite. Do not remove that without also disabling blending.
+ *  - Every cascade buffer is *right-facing*: planes run along x, rays travel
+ *    towards +x. The four 90-degree frustums are the same passes over the same
+ *    layout with the scene rotated underneath, which {@link FRUSTUM} does.
+ *  - A ray is stored as `vec4(radiance, transmittance)` -- the light it picked
+ *    up along its length, and what is left of anything arriving behind it. One
+ *    channel of transmittance rather than three, matching the library's
+ *    single-channel occlusion.
+ *  - Every fragment writes alpha, so blending must be off (or additive with the
+ *    alpha ignored). Do not add a plain alpha blend to any of these passes.
  */
 
 /** Shared fullscreen-quad vertex shader. `aPosition` is a unit quad; the mesh is scaled to the target. */
@@ -31,9 +36,55 @@ void main() {
 `;
 
 /**
- * Jump-flood seeding. Any texel that either occludes or emits becomes a seed,
- * so the distance field also stops rays inside non-occluding emissive volumes.
- * Stores the seed position in GI pixel space; negative x means "no seed".
+ * Cascade memory <-> scene, for the frustum in `uFrustum`.
+ *
+ *  0: +x, the identity.   1: +y, transposed.
+ *  2: -x, mirrored.       3: -y, transposed the other way.
+ *
+ * Each is its own inverse, so the same call serves the seed (memory -> scene)
+ * and the resolve (scene -> memory). Texel centres map to texel centres, which
+ * is what lets the seed sample the scene without any filtering error.
+ */
+const FRUSTUM = /* glsl */ `
+uniform float uExtent;
+uniform float uFrustum;
+
+vec2 frustum(vec2 p) {
+    vec2 r = mix(p, p.yx, mod(uFrustum, 2.0));
+    return mix(r, uExtent - r, step(0.5, mod(uFrustum, 3.0)));
+}
+`;
+
+/**
+ * One ray out of a cascade's buffer, and the front-to-back join that chains two
+ * of them. Rays outside the buffer read as "nothing here, nothing blocked", so
+ * the hierarchy simply runs out at the edges instead of needing a bounds test
+ * at every call site.
+ *
+ * `stride` is how many texels a plane occupies -- `interval + 1` for a ray
+ * buffer, `1` for a cone buffer, whose index is the cone rather than the ray.
+ */
+const FETCH = /* glsl */ `
+vec4 fetch(sampler2D tex, vec2 size, vec2 probe, float index, float interval, float stride) {
+    vec2 p = vec2(floor(probe.x / interval) * stride + index + 0.5, probe.y) / size;
+    return floor(p) == vec2(0.0) ? texture(tex, p) : vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+vec4 join(vec4 near, vec4 far) {
+    return vec4(near.rgb + far.rgb * near.a, near.a * far.a);
+}
+`;
+
+/**
+ * Cascade 0's rays, straight off the scene. Their interval is one pixel, so both
+ * rays of a probe begin and end on the probe's own texel and neither needs
+ * tracing -- read the emission and the transmittance there and be done. This is
+ * the *only* pass that touches the scene; everything above it is ray extension,
+ * which is what makes the hierarchy cost `log2(extent)` samples per ray.
+ *
+ * Emission is radiance per pixel of travel, not a surface radiance, so a pixel
+ * that emits without occluding still lights the room -- unlike a strict
+ * volumetric model, where an emitter has to absorb to be visible.
  */
 export const SEED_FRAG = /* glsl */ `#version 300 es
 precision highp float;
@@ -42,170 +93,166 @@ out vec4 finalColor;
 
 uniform sampler2D uEmissive;
 uniform sampler2D uOcclusion;
-uniform vec2 uSceneSize;
-
-void main() {
-    float occ = texture(uOcclusion, vUV).a;
-    vec3 emissive = texture(uEmissive, vUV).rgb;
-    bool solid = occ > 0.002 || max(emissive.r, max(emissive.g, emissive.b)) > 0.002;
-    finalColor = solid ? vec4(vUV * uSceneSize, 0.0, 1.0) : vec4(-1.0, -1.0, 0.0, 1.0);
-}
-`;
-
-/** One jump-flood iteration at `uStep` texels. */
-export const JFA_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
-
-uniform sampler2D uSeed;
-uniform vec2 uSceneSize;
-uniform float uStep;
-
-void main() {
-    vec2 here = vUV * uSceneSize;
-    vec2 best = vec2(-1.0);
-    float bestDist = 1e20;
-
-    for (int y = -1; y <= 1; y++) {
-        for (int x = -1; x <= 1; x++) {
-            vec2 offset = vec2(float(x), float(y)) * uStep;
-            vec2 sampleUV = (here + offset) / uSceneSize;
-            if (sampleUV.x < 0.0 || sampleUV.y < 0.0 || sampleUV.x > 1.0 || sampleUV.y > 1.0) continue;
-            vec2 candidate = texture(uSeed, sampleUV).xy;
-            if (candidate.x < 0.0) continue;
-            float d = dot(candidate - here, candidate - here);
-            if (d < bestDist) { bestDist = d; best = candidate; }
-        }
-    }
-    finalColor = vec4(best, 0.0, 1.0);
-}
-`;
-
-/**
- * One cascade of vanilla radiance cascades.
- *
- * Memory layout: the target is tiled into `uDirGrid x uDirGrid` blocks, each
- * `uProbeCount` texels, one block per ray direction. Because probe spacing
- * doubles and the direction count quadruples per cascade, the used region has
- * (near) constant area across the hierarchy.
- *
- * Each texel marches its interval through the distance field, then merges what
- * it did not resolve with the four angular children in the parent cascade,
- * bilinearly interpolated in space (plain bilinear -- this is vanilla RC, not
- * the "bilinear fix" variant).
- */
-export const CASCADE_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
-
-uniform sampler2D uEmissive;
-uniform sampler2D uOcclusion;
-uniform sampler2D uSeed;
-uniform sampler2D uParent;
-
-uniform vec2 uSceneSize;
 uniform vec2 uTexSize;
-uniform vec2 uParentTexSize;
-uniform vec2 uProbeCount;
-uniform vec2 uParentProbeCount;
-uniform float uDirGrid;
-uniform float uSpacing;
-uniform float uParentSpacing;
-uniform float uIntervalStart;
-uniform float uIntervalEnd;
-uniform float uStride;
-/// log2(uStride), on the CPU rather than 500M times a frame in the loop below.
-uniform float uStrideMip;
-uniform float uMaxSteps;
-/**
- * Where the probe grid starts inside the buffers, in GI pixels. The grid covers
- * the view only; the buffers hold this much extra world on every side, which
- * rays march through but no probe sits in. Probe space is the buffer shifted by
- * this, and it is what the parent merge and the composite both work in.
- */
-uniform vec2 uProbeOrigin;
-uniform float uHasParent;
 uniform float uEmissiveScale;
-uniform vec3 uSky;
+${FRUSTUM}
 
-const float TAU = 6.28318530718;
-/// Seeds sit at texel centres, so back off by half a diagonal to keep the
-/// sphere-tracing step conservative.
-const float SEED_RADIUS = 0.75;
+void main() {
+    vec2 texel = vUV * uTexSize;
+    // Two texels per plane, one per ray, holding the same thing.
+    float plane = floor(texel.x * 0.5);
+    vec2 uv = frustum(vec2(plane + 0.5, texel.y)) / uExtent;
+    finalColor = vec4(
+        texture(uEmissive, uv).rgb * uEmissiveScale,
+        1.0 - texture(uOcclusion, uv).a);
+}
+`;
 
-vec3 mergeParent(vec2 origin, float childDir) {
-    vec2 probeF = origin / uParentSpacing - 0.5;
-    // Clamp inside the tile so the hardware bilinear tap never bleeds into a
-    // neighbouring direction block.
-    vec2 local = clamp(probeF, vec2(0.0), uParentProbeCount - 1.0) + 0.5;
-    float parentGrid = uDirGrid * 2.0;
+/**
+ * Ray extension: build cascade `n`'s rays out of cascade `n-1`'s, four child
+ * rays per parent, instead of tracing them.
+ *
+ * A parent ray spans two child planes. Take the child rays either side of the
+ * parent's direction, chain the left one into the right one and the right one
+ * into the left, and average: two chains that cross and converge back on the
+ * parent direction. Even ray indices land exactly on a child direction, both
+ * chains are identical and the average is a no-op.
+ *
+ * The averaging is angular diffusion, and it is why extensions start here at
+ * cascade 1 rather than at cascade 3 as the paper has it: more diffusion, and a
+ * moving light stops crawling.
+ */
+export const EXTEND_FRAG = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 finalColor;
 
-    vec3 sum = vec3(0.0);
-    for (int k = 0; k < 4; k++) {
-        float parentDir = childDir * 4.0 + float(k);
-        vec2 tile = vec2(mod(parentDir, parentGrid), floor(parentDir / parentGrid));
-        sum += texture(uParent, (tile * uParentProbeCount + local) / uParentTexSize).rgb;
-    }
-    return sum * 0.25;
+uniform sampler2D uPrev;
+uniform vec2 uPrevSize;
+uniform vec2 uTexSize;
+/// 2^n for the cascade being written. Its children are half this long.
+uniform float uInterval;
+${FETCH}
+
+vec4 extend(vec2 probe, float lo, float hi, float interval, float stride) {
+    vec2 far = probe + vec2(interval, -interval + lo * 2.0);
+    return join(
+        fetch(uPrev, uPrevSize, probe, lo, interval, stride),
+        fetch(uPrev, uPrevSize, far, hi, interval, stride));
 }
 
 void main() {
-    vec2 texel = floor(vUV * uTexSize);
-    vec2 tile = floor(texel / uProbeCount);
-    if (tile.x >= uDirGrid || tile.y >= uDirGrid) {
-        finalColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    vec2 probe = texel - tile * uProbeCount;
+    vec2 texel = vUV * uTexSize;
+    float rays = uInterval + 1.0;
+    float plane = floor(texel.x / rays);
+    float index = floor(texel.x - plane * rays);
+    vec2 probe = vec2(plane * uInterval + 0.5, texel.y);
 
-    float dirIndex = tile.y * uDirGrid + tile.x;
-    float dirCount = uDirGrid * uDirGrid;
-    float angle = (dirIndex + 0.5) * TAU / dirCount;
-    vec2 dir = vec2(cos(angle), sin(angle));
-    vec2 origin = (probe + 0.5) * uSpacing;
+    float child = uInterval * 0.5;
+    float lower = floor(index * 0.5);
+    float upper = ceil(index * 0.5);
+    finalColor = mix(
+        extend(probe, lower, upper, child, child + 1.0),
+        extend(probe, upper, lower, child, child + 1.0),
+        0.5);
+}
+`;
 
-    vec3 radiance = vec3(0.0);
-    float transmittance = 1.0;
-    float t = uIntervalStart;
-    bool escaped = false;
+/**
+ * Merge cascade `n`'s rays into its cones, against the cones of cascade `n+1`.
+ *
+ * A cascade with `2^n + 1` rays has `2^n` angular spans between them, and it is
+ * those -- the cones -- that carry fluence. Each cone is its two bounding rays,
+ * every ray merged with the cascade-above cone that starts where it ends.
+ *
+ * Because probes are planes, a ray carries rectangular radiance, so it has to be
+ * weighted by half the angular span of the cone it lands in before merging. That
+ * is `wedge`, and it is the whole reason this looks nothing like a vanilla RC
+ * merge.
+ *
+ * Odd planes land exactly on a plane of the cascade above. Even ones fall half
+ * an interval short of it, so their rays reach twice as far, merge against the
+ * far plane, and the result is averaged with the merge at the near plane --
+ * fluence interpolated *after* merging. Interpolating position instead, or
+ * before, breaks the volumetrics outright.
+ */
+export const MERGE_FRAG = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 finalColor;
 
-    for (int i = 0; i < 64; i++) {
-        if (float(i) >= uMaxSteps || t >= uIntervalEnd) break;
-        vec2 p = origin + uProbeOrigin + dir * t;
-        if (p.x < 0.0 || p.y < 0.0 || p.x >= uSceneSize.x || p.y >= uSceneSize.y) { escaped = true; break; }
+/// This cascade's rays.
+uniform sampler2D uRays;
+uniform vec2 uRaysSize;
+/// Cascade n+1's cones. Bind a 1x1 texture with uConesSize = (1,1) at the top
+/// of the hierarchy: every lookup then falls outside it and reads as empty.
+uniform sampler2D uCones;
+uniform vec2 uConesSize;
+uniform vec2 uTexSize;
+uniform float uInterval;
+${FETCH}
 
-        vec2 uv = p / uSceneSize;
-        vec2 seed = texture(uSeed, uv).xy;
-        float d = seed.x < 0.0 ? 1e6 : max(distance(seed, p) - SEED_RADIUS, 0.0);
+/** One bounding ray of cone "index", merged into the cone above it. */
+vec3 edge(vec2 probe, float plane, float index, float side) {
+    float cone = index * 2.0 + side;
+    float ray = index + side;
+    float stride = uInterval + 1.0;
+    float align = 2.0 - mod(plane, 2.0);
+    vec2 reach = vec2(uInterval, -uInterval + ray * 2.0);
 
-        // Anything nearer than one stride counts as medium. A fixed threshold
-        // here instead makes the ray crawl: at stride 32 a surface 5px away
-        // costs six sub-pixel steps to reach, which is most of the step budget
-        // spent on ground the level cannot resolve anyway.
-        if (d < 0.5) {
-            // Riemann sum over uStride pixels of medium: emission is per pixel of
-            // travel, so it scales linearly, absorption compounds.
-            radiance += transmittance * textureLod(uEmissive, uv, uStrideMip).rgb * uEmissiveScale * uStride;
-            float occ = texture(uOcclusion, uv).a;
-            transmittance *= pow(max(1.0 - occ, 0.0), uStride);
-            if (transmittance < 0.004) { transmittance = 0.0; break; }
-            t += uStride;
-        } else {
-            t += d;
-        }
-    }
+    vec2 lo = vec2(2.0 * uInterval, -2.0 * uInterval + cone * 2.0);
+    vec2 hi = vec2(2.0 * uInterval, -2.0 * uInterval + (cone + 1.0) * 2.0);
+    float wedge = 0.5 * (atan(hi.y, hi.x) - atan(lo.y, lo.x));
 
-    if (transmittance > 0.0) {
-        if (escaped || uHasParent < 0.5) {
-            radiance += transmittance * uSky;
-        } else {
-            radiance += transmittance * mergeParent(origin, dirIndex);
-        }
-    }
+    vec4 r = fetch(uRays, uRaysSize, probe, ray, uInterval, stride);
+    vec3 far = fetch(uCones, uConesSize, probe + align * reach, cone, 1.0, 1.0).rgb;
+    if (align < 1.5) return r.rgb * wedge + far * r.a;
 
-    finalColor = vec4(radiance, 1.0);
+    r = join(r, fetch(uRays, uRaysSize, probe + reach, ray, uInterval, stride));
+    vec3 near = fetch(uCones, uConesSize, probe, cone, 1.0, 1.0).rgb;
+    return mix(r.rgb * wedge + far * r.a, near, 0.5);
+}
+
+void main() {
+    vec2 texel = vUV * uTexSize;
+    float plane = floor(texel.x / uInterval);
+    float index = floor(texel.x - plane * uInterval);
+    vec2 probe = vec2(plane * uInterval + 0.5, texel.y);
+
+    // Plane 0's rays would have to come from outside the buffer. The resolve
+    // pass reads one texel further in, so nothing ever looks here.
+    finalColor = plane < 1.0
+        ? vec4(0.0)
+        : vec4(edge(probe, plane, index, 0.0) + edge(probe, plane, index, 1.0), 1.0);
+}
+`;
+
+/**
+ * One frustum's cascade-0 cones, un-rotated into the scene and added to the
+ * fluence buffer. Run additively, once per frustum.
+ *
+ * Read one texel along the frustum's own direction: consecutive frustums share
+ * the ray on the boundary between them, and sampling at the pixel itself would
+ * count it twice.
+ *
+ * `uNorm` turns fluence into mean incoming radiance, so `strength: 1` means
+ * "as bright as the light actually arriving". The weights above sum to pi rather
+ * than the full 2pi of directions -- each ray carries half of its cone's span
+ * and the two halves belong to different cones -- so that, not 2pi, is the
+ * divisor.
+ */
+export const RESOLVE_FRAG = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 finalColor;
+
+uniform sampler2D uCones;
+uniform float uNorm;
+${FRUSTUM}
+
+void main() {
+    vec2 p = frustum(vUV * uExtent) + vec2(1.0, 0.0);
+    finalColor = vec4(texture(uCones, p / uExtent).rgb * uNorm, 1.0);
 }
 `;
 
@@ -308,8 +355,8 @@ void main() {
 `;
 
 /**
- * Resolve cascade 0 to per-pixel irradiance and shade the albedo with it.
- * Rendered straight into the scene graph, so it also does exposure + tone map.
+ * Shade the albedo with the resolved fluence. Rendered straight into the scene
+ * graph, so it also does exposure + tone map.
  *
  * Occluding pixels take their light from `uLight` -- the buffer the deferred
  * light pass accumulated -- instead of the cascades. See {@link LIGHT_FRAG}.
@@ -323,24 +370,20 @@ uniform sampler2D uAlbedo;
 uniform sampler2D uEmissive;
 uniform sampler2D uOcclusion;
 uniform sampler2D uLight;
-uniform sampler2D uCascade0;
+uniform sampler2D uFluence;
 
 uniform vec2 uSceneSize;
-uniform vec2 uCascadeTexSize;
-uniform vec2 uProbeCount;
-uniform float uSpacing;
 /**
  * GI pixels the lighting buffers are offset from the albedo: they are rasterised
- * snapped to a coarse grid, so that everything filtering them stays put in the
- * world, while the albedo uses the exact camera. Every lookup into a lighting
- * buffer is shifted by this to land on the world point this fragment shows.
+ * snapped to whole texels, so that an emitter's footprint stays put in the world
+ * as the camera moves, while the albedo uses the exact camera. Every lookup into
+ * a lighting buffer is shifted by this to land on the world point this fragment
+ * shows.
  */
 uniform vec2 uGiOffset;
-/// Where probe space starts inside the buffers -- the off-view world the rays
-/// march through. See uProbeOrigin in CASCADE_FRAG.
+/// Where the view starts inside the buffers -- the off-view world the rays also see.
 uniform vec2 uMargin;
-/// The screen, in GI pixels. Smaller than uSceneSize, which the snap and the
-/// margin both pad.
+/// The screen, in GI pixels. Smaller than uSceneSize, which the margin pads.
 uniform vec2 uViewSize;
 uniform float uStrength;
 uniform float uExposure;
@@ -352,19 +395,10 @@ uniform vec3 uOccluderAmbient;
 uniform float uLightStrength;
 
 void main() {
-    // Where this fragment's world point sits in probe space, and in the buffers.
-    vec2 p = vUV * uViewSize + uGiOffset;
-    vec2 giUV = (p + uMargin) / uSceneSize;
-    vec2 probeF = p / uSpacing - 0.5;
-    vec2 local = clamp(probeF, vec2(0.0), uProbeCount - 1.0) + 0.5;
+    // Where this fragment's world point sits in the lighting buffers.
+    vec2 giUV = (vUV * uViewSize + uGiOffset + uMargin) / uSceneSize;
 
-    vec3 irradiance = vec3(0.0);
-    for (int d = 0; d < 4; d++) {
-        vec2 tile = vec2(mod(float(d), 2.0), floor(float(d) / 2.0));
-        irradiance += texture(uCascade0, (tile * uProbeCount + local) / uCascadeTexSize).rgb;
-    }
-    irradiance *= 0.25;
-
+    vec3 irradiance = texture(uFluence, giUV).rgb;
     vec4 albedo = texture(uAlbedo, vUV);
     vec3 emissive = texture(uEmissive, giUV).rgb * uEmissiveScale * uEmissiveBoost;
 

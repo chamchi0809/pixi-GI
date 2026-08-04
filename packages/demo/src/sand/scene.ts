@@ -135,9 +135,10 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
     occlusion: 1,
     occlusionMap: occlusion.texture,
     emissive: 0xffffff,
-    // Low, because lava is semi-transparent in the occlusion map: a ray
-    // crossing a wide lake accumulates this once per pixel it passes.
-    emissiveIntensity: 1.5,
+    // Still the lowest number in the scene, because lava is semi-transparent in
+    // the occlusion map: a ray crossing a wide lake accumulates this once per
+    // pixel it passes.
+    emissiveIntensity: 7,
     emissiveMap: emission.texture,
     occluderLight: false,
   });
@@ -163,13 +164,13 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
       const s = new Sprite(kind.frames[0]);
       // Nudged one pixel off the rock so the flame is not buried in it.
       s.position.set(t.x - ((TORCH_W / 2) | 0) + t.dir, t.y - TORCH_H + 1);
-      // Up from 5: a fireball looks far wider than this only because its
-      // ember trail is ~90 emitters spread over the screen. A torch is
-      // five flame pixels standing still, so the reach has to come from
-      // intensity. This is the knob to turn if the cave reads too bright.
+      // A fireball looks far wider than this only because its ember trail is
+      // ~90 emitters spread over the screen. A torch is five flame pixels
+      // standing still, so the reach has to come from intensity. This is the
+      // knob to turn if the cave reads too bright.
       setMaterial(s, {
         emissive: kind.light,
-        emissiveIntensity: 12,
+        emissiveIntensity: 55,
         occlusion: 1,
       });
       torchLayer.addChild(s);

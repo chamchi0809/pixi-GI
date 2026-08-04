@@ -27,15 +27,14 @@ async function main(): Promise<void> {
   // Only the active scene's root lives in here.
   const world = new Container();
 
-  // `resolution` / `probeSpacing` are fixed at construction (they decide every
-  // buffer size), so switching quality means a new instance. Everything else is
-  // a runtime setter, so switching *scenes* does not.
+  // `resolution` is fixed at construction (it decides every buffer size), so
+  // switching quality means a new instance. Everything else is a runtime setter,
+  // so switching *scenes* does not.
   const QUALITY = [
-    { name: "pixel", resolution: 1, probeSpacing: 1 },
-    { name: "sharp", resolution: 1, probeSpacing: 2 },
-    { name: "fast", resolution: 0.5, probeSpacing: 2 },
+    { name: "sharp", resolution: 0.5 },
+    { name: "fast", resolution: 0.25 },
   ] as const;
-  let quality = 2; // "fast"
+  let quality = 0; // "sharp"
   let giEnabled = true;
   let showDebug = true;
   let exposure = 0.95;
@@ -46,8 +45,6 @@ async function main(): Promise<void> {
       renderer: app.renderer,
       world,
       resolution: QUALITY[quality]!.resolution,
-      probeSpacing: QUALITY[quality]!.probeSpacing,
-      sky: 0x000000,
       strength: giEnabled ? 1 : 0,
       exposure,
     });

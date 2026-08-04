@@ -1,6 +1,6 @@
 # pixi-rcgi
 
-Vanilla **radiance cascades** global illumination for [PixiJS](https://pixijs.com) v8.
+**Holographic radiance cascades** global illumination for [PixiJS](https://pixijs.com) v8.
 
 Light bounces, spreads and shadows in 2D from your existing scene graph. You tag
 objects with an emissive colour and how much light they block — per object, or
@@ -67,12 +67,9 @@ Required: `renderer`, `world`. Everything else has a default.
 
 | option | default | |
 | --- | --- | --- |
-| `resolution` | `0.5` | Fraction of the *logical* size the lighting runs at. |
-| `probeSpacing` | `2` | Cascade-0 probe spacing in lighting pixels. |
-| `cascades` | auto | Enough for the top ray to cross the diagonal. Lowering it caps how far light travels. |
-| `intervalLength` | `probeSpacing` | Cascade-0 ray length. |
-| `margin` | `0.5` | Off-view world that still emits and occludes, as a fraction of the view per side. `0` is screen-space. See below. |
-| `sky` | `0x000000` | Radiance for rays that leave the screen. |
+| `resolution` | `0.5` | Fraction of the *logical* size the lighting runs at. The only cost knob. See below. |
+| `cascades` | auto | As many as the buffer holds. Lowering it caps how far light travels, at `2^cascades` lighting pixels. |
+| `margin` | `0.5` | Off-view world that still emits and occludes, as a fraction of the view per side. Free, but capped. See below. |
 | `ambient` | `0x000000` | Flat light added everywhere. |
 | `occluderAmbient` | `0x000000` | Flat light for pixels that occlude. See below. |
 | `occluderLightRange` | `256` | How far an emitter's *surface* light reaches, in world pixels. |
@@ -86,43 +83,37 @@ Required: `renderer`, `world`. Everything else has a default.
 Runtime: `view`, `render()`, `resize(w, h)`, `destroy()`, `stats`, the mutable
 fields `strength`, `exposure`, `emissiveBoost`, `toneMap`,
 `occluderLightRange` / `occluderLightHeight` / `occluderLightStrength`, plus
-`sky` / `ambient` / `occluderAmbient` / `background` setters.
+`ambient` / `occluderAmbient` / `background` setters.
 
-#### Sharpness: `resolution` x `probeSpacing`
+#### Cost and sharpness: `resolution`
 
-These two are the only reason the lighting looks soft. Irradiance is computed at
-cascade-0 probes and interpolated between them, so it is sampled every
-**`probeSpacing / resolution` screen pixels**. At the defaults that is 4px, which
-reads as blur.
+HRC probes *every* lighting pixel — there is no probe spacing to trade away — so
+`resolution` alone sets both the sharpness and the price. Fluence is one texel
+per lighting pixel, and at `resolution: 1` shadow edges are pixel-crisp.
 
-`resolution: 1, probeSpacing: 1` gives exactly one probe per screen pixel: the
-composite lookup lands on a single texel with nothing to interpolate, and shadow
-edges are pixel-crisp.
+Every buffer is a square power of two big enough to hold the view, so what
+actually matters is `max(width, height) * resolution` and where it lands relative
+to a power of two. Measured on the demo, 960x540, Apple M1 Pro,
+Chrome/ANGLE-Metal — `hrc` is the whole hierarchy, all four frustums:
 
-Measured on the demo scene, 1280x720, Apple M1 Pro, Chrome/ANGLE-Metal, median
-of three runs. The 120s are the display's vsync cap, so those are floors:
+| `resolution` | buffers | cascades | `hrc` | frame |
+| --- | --- | --- | --- | --- |
+| `0.25` | 256² | 8 | 3.0ms | 8.3ms |
+| `0.5` | 512² | 9 | 8.5-10.4ms | vsync (16.7ms) |
 
-| `resolution` | `probeSpacing` | probe every | fps |
-| --- | --- | --- | --- |
-| `1` | `1` | 1px -- pixel-perfect | 79 |
-| `1` | `2` | 2px | 120 (capped) |
-| `0.5` | `2` (default) | 4px | 120 (capped) |
+Each step up is 4x the pixels *and* one more cascade, so expect a bit worse than
+4x. Memory is the harder ceiling: every cascade keeps its own ray buffer, so the
+hierarchy is `extent² * (cascades + 2)` RGBA16F texels — 23MB at 512, 96MB at
+1024, 436MB at 2048, which is where `MAX_EXTENT` stops.
 
-Pixel-perfect is inherently expensive and no tuning removes that: every cascade
-traces `4 * width * height / probeSpacing^2` rays, so halving the spacing
-quadruples every level of the hierarchy at once, and the extra reach adds a level
-on top -- 4.7x the rays here. Cost is linear in `width * height`, so lighting a
-smaller area is the lever that actually works.
+`resolution` is fixed at construction (every buffer size depends on it), so a
+quality setting means a new instance — see the demo's `Q` key. On a HiDPI canvas
+it is relative to the *logical* size, so pass `renderer.resolution` (not `1`) for
+physically pixel-perfect, at 4x the cost.
 
-Both are fixed at construction (every buffer size depends on them), so a quality
-setting means a new instance -- see the demo's `Q` key.
-
-On a HiDPI canvas `resolution` is relative to the *logical* size, so pass
-`renderer.resolution` (not `1`) for physical pixel-perfect, at 4x the cost.
-
-Two things stay soft regardless: penumbra width, which comes from cascade-0's 4
-directions, and the far field, which higher cascades integrate at their own
-(coarser) probe spacing.
+What stays soft is angular: cascade 0 resolves two rays per probe, and the
+extension chain averages crossed pairs on the way up, which is deliberate — that
+diffusion is what stops a moving light crawling.
 
 ### Lighting occluders
 
@@ -205,10 +196,10 @@ Read this before shipping with it.
   renderer. It also requires `EXT_color_buffer_float`; the constructor throws
   with a clear message when the device does not expose it.
 - **Three extra renders of your world per frame** (albedo, emission, occlusion),
-  plus the jump-flood, one draw per cascade and one instanced draw for all
-  occluder lights together. On a scene where PixiJS draw calls already dominate,
-  expect roughly 3× that cost. A **fourth** render is added the moment anything
-  in the scene has a `normalMap`.
+  plus one instanced draw for all occluder lights together and `4 * (2N + 1)`
+  fullscreen passes for the hierarchy — 76 at nine cascades. On a scene where
+  PixiJS draw calls already dominate, expect roughly 3× that cost. A **fourth**
+  render is added the moment anything in the scene has a `normalMap`.
 - **Occluders are not lit by the simulation.** They are lit by the separate,
   unshadowed deferred surface model described above. If you need a wall to be
   shadowed from a light by another wall, this is not it.
@@ -221,13 +212,20 @@ Read this before shipping with it.
   brightest emitter in the scene. A light 500× dimmer than the brightest one
   will band or vanish. Absolute HDR range is fine; the *ratio* is what is
   limited.
-- **Vanilla radiance cascades**, i.e. plain bilinear interpolation when merging
-  a cascade into its parent — not the "bilinear fix". Expect the known artefacts:
-  soft ringing around small bright emitters and light that bends slightly near
-  thin occluders at grazing angles.
-- **Probe-resolution shadows.** Penumbra detail below one cascade-0 probe
-  spacing (`probeSpacing / resolution` screen pixels — 4px at the defaults) does
-  not exist. Thin occluders can be missed entirely at higher cascades.
+- **Holographic radiance cascades**, and specifically the *ray-extension*
+  variant: only cascade 0 ever samples the scene, and every ray above it is built
+  from four rays of the cascade below. That is what makes each ray `O(log N)`
+  instead of a march, and it is why this is memory-bound rather than
+  bandwidth-bound. Extensions start at cascade 0 rather than cascade 3 as the
+  paper has it — more angular diffusion, and a light you carry around stops
+  crawling.
+- **Light bends at grazing angles.** Rays are chained rather than traced, so a
+  chain can slip past a thin occluder that a straight ray would have hit, and
+  light leaks a little around the ends of thin walls. Cascade 0 is exact; the
+  error grows with the cascade.
+- **Memory grows with `resolution`, not just time.** Every cascade holds its own
+  ray buffer for the whole merge, so there is no streaming it — see the table
+  above, and `MAX_EXTENT` (2048) as the hard stop.
 - **2D only, single bounce of the scene as drawn.** There is no albedo feedback
   loop: light bounces off surfaces via the cascade merge, but a lit surface does
   not re-emit its own albedo.
@@ -235,42 +233,44 @@ Read this before shipping with it.
   uses colour × alpha × the `emissive` tint.
 - **The world container must not be on the stage.** Add `gi.view` instead. If
   you add both you will render the scene twice.
-- **Off-view world reaches only as far as `margin`.** The scene the rays march
-  through is the view grown by `margin` — a fraction of it, `0.5` by default, so
-  the lit region is twice the view on both axes. A light or a wall further out
-  than that contributes nothing, and rays leaving the buffers take `sky`. The
-  three world renders and the jump flood grow with the area, so `0.5` is 4x the
-  area of `0`; the cascade passes are sized by the view and do not change. Past
-  the top cascade's reach (about the view diagonal) more margin buys nothing.
-  `margin: 0` is the old screen-space behaviour.
+- **`margin` is capped by the power-of-two rounding, not by what you ask for.**
+  The buffers are square and already rounded up past the view, and the margin is
+  the slack that rounding paid for — so it costs nothing, and asking for more than
+  fits is clamped rather than honoured (honouring it would double `extent` and
+  quadruple the memory). On 16:9 that means plenty of off-view world above and
+  below and almost none either side: 1920x1080 at `resolution: 0.5` gets 483
+  lighting pixels of margin vertically and 63 horizontally. Rays that leave the
+  buffers see nothing — there is no sky term.
 - **Camera zoom is a `world.scale`,** and it is read off that transform every
   frame — no reallocation, and `margin` follows it because it is a fraction.
   Probe spacing and ray reach are fixed in *buffer* pixels, so zooming out shows
   more world lit at the same screen sharpness rather than the same world lit more
   coarsely. `occluderLightRange` / `occluderLightHeight` are the two knobs in
   world pixels, scaled by the zoom so a torch lights the same wall either way.
-  While the zoom is *changing*, the snap grid below is rescaling with it, so
-  expect the same pumping a resize gives; it settles the moment the zoom does.
 - **No sub-region / scrolling optimisation.** The lighting always covers the
   full logical size, re-rendered from scratch every frame; nothing is cached
-  between frames even though the probe grid is world-aligned.
-- **The lighting buffers are wider than the screen.** They are rasterised
-  snapped to a grid the size of the coarsest cascade's stride, because everything
-  that filters them — the emissive mip pyramid above all — is aligned to the
-  buffer rather than to the world, and a camera that slides across those cells
-  pumps the light. Snapping pins them to fixed world positions; the padding is
-  what keeps every visible pixel inside a buffer the snap has pushed off-screen.
-  Costs about 15-30% of the lighting passes, and the picture still moves at
-  sub-pixel precision — only the lighting *grid* is quantised.
-  Read the camera from `world`'s own transform, so move it there and not on a
-  child, or the snap has nothing to snap and the flicker comes back.
+  between frames.
+- **The lighting buffers are rasterised snapped to whole texels.** Every ray in
+  the hierarchy starts and ends on a texel centre, so a world drawn half a texel
+  off would slide across the ray fan as the camera moves and pump the light. The
+  picture itself still moves at sub-pixel precision — only the *lighting* is
+  quantised. The camera is read from `world`'s own transform, so move it there and
+  not on a child, or there is nothing to snap and the flicker comes back.
 
 ## Check
 
-`pnpm check` runs `check.ts`, which asserts the cascade hierarchy is
-contiguous, memory-invariant and reaches the screen diagonal, and that the
-occluder light packing culls and converts to GI pixels correctly. The GPU
-passes are not unit-tested — they are verified by looking at the demo.
+`pnpm check` runs `check.ts`, which asserts the buffer layout is square,
+power-of-two, big enough for the view and its margins, and that every cascade's
+planes tile it exactly, plus that the occluder light packing culls and converts
+to GI pixels correctly. The GPU passes are not unit-tested — they are verified by
+looking at the demo.
+
+## Credits
+
+Radiance cascades is Alexander Sannikov's technique. The holographic variant is
+[Yaazarai's](https://github.com/Yaazarai/Volumetric-HRC), after
+[arXiv:2505.02041](https://arxiv.org/abs/2505.02041); this is a port of its
+ray-extension implementation.
 
 ## License
 

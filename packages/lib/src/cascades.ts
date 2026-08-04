@@ -1,99 +1,79 @@
 /**
- * The cascade hierarchy: pure arithmetic, no PixiJS. Kept separate so it can be
- * checked without a GPU (`pnpm --filter pixi-rcgi check`).
- */
-
-/** @internal One level of the hierarchy, in lighting-resolution pixels. */
-export interface CascadeLevel {
-    /** Distance between probes. */
-    spacing: number;
-    probeX: number;
-    probeY: number;
-    /** Directions are laid out in a `dirGrid x dirGrid` block grid. */
-    dirGrid: number;
-    intervalStart: number;
-    intervalEnd: number;
-    /** Volumetric integration step, in lighting pixels. Empty space is still skipped by the SDF. */
-    stride: number;
-    maxSteps: number;
-}
-
-/**
- * @internal
- * Vanilla radiance cascades: per level, probe spacing doubles, the direction
- * count quadruples, and the ray interval quadruples, so each level costs about
- * the same and the whole hierarchy is memory-invariant.
- */
-export function buildLevels(
-    giWidth: number,
-    giHeight: number,
-    probeSpacing: number,
-    intervalLength: number,
-    override?: number,
-): CascadeLevel[] {
-    // Ray reach after n cascades is intervalLength * (4^n - 1) / 3; solve for
-    // the first n that spans the screen diagonal.
-    const diagonal = Math.hypot(giWidth, giHeight);
-    const auto = Math.ceil(Math.log((3 * diagonal) / intervalLength + 1) / Math.log(4));
-    const count = Math.min(10, Math.max(1, override ?? auto));
-
-    const levels: CascadeLevel[] = [];
-    for (let n = 0; n < count; n++) {
-        const scale = 4 ** n;
-        const spacing = probeSpacing * 2 ** n;
-        const start = (intervalLength * (scale - 1)) / 3;
-        const length = intervalLength * scale;
-        // A cascade cannot resolve anything finer than its own probe spacing, so
-        // that is also the step it integrates media at. Marching a 4096px
-        // top-cascade ray one pixel at a time was ~40% of the frame.
-        const stride = spacing;
-        levels.push({
-            spacing,
-            probeX: Math.max(1, Math.ceil(giWidth / spacing)),
-            probeY: Math.max(1, Math.ceil(giHeight / spacing)),
-            dirGrid: 2 ** (n + 1),
-            intervalStart: start,
-            intervalEnd: start + length,
-            stride,
-            // Empty space is skipped by the distance field, so this only has to
-            // cover the worst case of grazing along a surface.
-            maxSteps: Math.min(64, Math.ceil(length / stride) + 8),
-        });
-    }
-    return levels;
-}
-
-/**
- * @internal
- * Texels the lighting buffers must be rasterised on to keep everything that
- * filters them -- the emissive mip pyramid above all -- landing on fixed world
- * positions rather than sliding with the camera.
+ * The holographic-radiance-cascade buffer layout: pure arithmetic, no PixiJS.
+ * Kept separate so it can be checked without a GPU (`pnpm --filter pixi-rcgi check`).
  *
- * That is the coarsest level's stride, which is both its probe spacing and the
- * mip cell it averages over; the two only differ when `probeSpacing` is not a
- * power of two, and then the snap has to be a multiple of both. Levels coarser
- * than `fit` are skipped: they barely vary across the screen, and the buffers are
- * padded by the snap, so snapping to one would cost more than the whole buffer --
- * which an explicit `cascades: 10` would otherwise do.
+ * HRC casts probes as *planes* rather than a lattice. Cascade `n` puts a plane
+ * every `2^n` pixels, each plane holds one probe per pixel row, and each probe
+ * casts `2^n + 1` rays fanning across 90 degrees -- so one ray every two pixels
+ * of the frustum's width, whatever the cascade. The 90 degrees is why the whole
+ * thing runs four times, once per frustum direction, with the scene rotated
+ * under it; that rotation swaps x and y, which is why every buffer is square.
  */
-export function snapQuantum(levels: CascadeLevel[], fit: number): number {
-    let top = levels[0]!;
-    for (const level of levels) if (level.spacing <= fit) top = level;
-    const cell = 2 ** Math.ceil(Math.log2(top.stride));
-    return (top.spacing * cell) / gcd(top.spacing, cell);
+
+/**
+ * Largest square lighting buffer this will allocate. The ray buffers together
+ * cost `extent^2 * (cascades + 2)` texels, so this is a memory cliff, not a
+ * speed one: 512 is ~23MB, 1024 ~96MB, 2048 ~436MB. Lower `resolution` rather
+ * than reaching for the ceiling.
+ */
+export const MAX_EXTENT = 2048;
+
+/** @internal Where the lighting buffers sit, in lighting-resolution pixels. */
+export interface HrcLayout {
+    /**
+     * Side of every lighting buffer. Square because the frustum rotations swap
+     * x and y, and a power of two so every cascade's planes tile it exactly.
+     */
+    extent: number;
+    /**
+     * Merge levels. Cascade `n` reaches `2^n` pixels and they are contiguous, so
+     * the hierarchy reaches `2^cascades` -- the buffer, unless capped.
+     */
+    cascades: number;
+    /** Where the view starts inside the buffers. The rest is off-view world the rays still see. */
+    marginX: number;
+    marginY: number;
 }
 
-function gcd(a: number, b: number): number {
-    return b ? gcd(b, a % b) : a;
+/**
+ * @internal
+ * Fit the buffers around a view. `extent` is the next power of two that holds
+ * the view plus a texel of snap slack; whatever that rounding leaves over
+ * becomes margin, capped at `marginFraction` of the view per side.
+ *
+ * The margin is therefore free -- it is space the power of two paid for
+ * already. Asking for more than the rounding left would double `extent` and
+ * quadruple the memory, so it is clamped instead of honoured.
+ */
+export function buildLayout(
+    viewW: number,
+    viewH: number,
+    marginFraction: number,
+    override?: number,
+): HrcLayout {
+    const need = Math.max(viewW, viewH) + 1;
+    const extent = Math.min(MAX_EXTENT, 2 ** Math.ceil(Math.log2(Math.max(2, need))));
+    const top = Math.log2(extent);
+    return {
+        extent,
+        cascades: Math.max(1, Math.min(top, Math.round(override ?? top))),
+        marginX: margin(viewW, extent, marginFraction),
+        marginY: margin(viewH, extent, marginFraction),
+    };
 }
 
-/** @internal Size of the cascade render targets: the largest level decides. */
-export function cascadeTextureSize(levels: CascadeLevel[]): { width: number; height: number } {
-    let width = 1;
-    let height = 1;
-    for (const level of levels) {
-        width = Math.max(width, level.probeX * level.dirGrid);
-        height = Math.max(height, level.probeY * level.dirGrid);
-    }
-    return { width, height };
+function margin(view: number, extent: number, fraction: number): number {
+    const room = Math.floor((extent - view - 1) / 2);
+    return Math.max(0, Math.min(Math.round(view * fraction), room));
+}
+
+/**
+ * @internal
+ * Width of cascade `n`'s ray buffer. Every plane stores its `2^n + 1` rays
+ * side by side, so this is a little wider than `extent` -- 2x at cascade 0,
+ * where each of the two rays is one pixel long, and tending to 1x above.
+ */
+export function raysWidth(extent: number, n: number): number {
+    const interval = 2 ** n;
+    return Math.floor(extent / interval) * (interval + 1);
 }

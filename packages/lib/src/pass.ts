@@ -1,13 +1,18 @@
 import { Buffer, BufferUsage, Container, Geometry, Mesh, Shader } from 'pixi.js';
-import type { Renderer, RenderTexture, TextureSource } from 'pixi.js';
+import type { BLEND_MODES, Renderer, RenderTexture, TextureSource } from 'pixi.js';
 import { LIGHT_FRAG, LIGHT_VERTEX, VERTEX } from './shaders';
 import { LIGHT_FLOATS } from './lights';
 
 /** A fullscreen shader pass, drawn as a unit quad scaled to the target. */
 export class Pass {
     readonly mesh: Mesh<Geometry, Shader>;
+    /**
+     * A Mesh is only given its `groupBlendMode` as somebody's *child*; as the
+     * root of a `renderer.render` call it would silently stay `normal`.
+     */
+    private readonly _root = new Container();
 
-    constructor(name: string, fragment: string, resources: Record<string, unknown>) {
+    constructor(name: string, fragment: string, resources: Record<string, unknown>, blendMode?: BLEND_MODES) {
         const shader = Shader.from({
             gl: { vertex: VERTEX, fragment, name },
             resources,
@@ -17,6 +22,8 @@ export class Pass {
             indexBuffer: [0, 1, 2, 0, 2, 3],
         });
         this.mesh = new Mesh<Geometry, Shader>({ geometry, shader });
+        if (blendMode) this.mesh.blendMode = blendMode;
+        this._root.addChild(this.mesh);
     }
 
     /** Uniform groups and texture slots, by shader resource name. */
@@ -28,13 +35,14 @@ export class Pass {
         this.resources[name] = source;
     }
 
-    run(renderer: Renderer, target: RenderTexture): void {
+    /** `clear: false` accumulates into whatever is already there -- for the additive passes. */
+    run(renderer: Renderer, target: RenderTexture, clear = true): void {
         this.mesh.scale.set(target.width, target.height);
-        renderer.render({ container: this.mesh, target, clear: true, clearColor: 0x000000 });
+        renderer.render({ container: this._root, target, clear, clearColor: [0, 0, 0, 0] });
     }
 
     destroy(): void {
-        this.mesh.destroy({ children: true });
+        this._root.destroy({ children: true });
     }
 }
 

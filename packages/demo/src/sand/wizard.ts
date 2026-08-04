@@ -124,7 +124,7 @@ export class Wizard {
 
         this.staff = new Sprite(SPARK);
         this.staff.anchor.set(0.5);
-        setMaterial(this.staff, { emissive: 0x9fe4ff, emissiveIntensity: 6, occlusion: 1 });
+        setMaterial(this.staff, { emissive: 0x9fe4ff, emissiveIntensity: 26, occlusion: 1 });
 
         this.view.addChild(this.body, this.staff);
     }
