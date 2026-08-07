@@ -287,6 +287,18 @@ uniform sampler2D uEmissive;
 uniform sampler2D uOcclusion;
 uniform sampler2D uNormal;
 uniform sampler2D uFluence;
+/**
+ * The same emission and occlusion, drawn at albedo resolution with the albedo's
+ * own camera. Everything else the composite reads is light, which is allowed to
+ * be soft, but these two are *the objects themselves* -- an emitter's own glow
+ * and the mask that says which pixels get occluder shading -- so taking them
+ * from the lighting buffers would show the resolution option as blocky emitters
+ * and stair-stepped occluder edges. Only bound below 1:1; see uUpscale.
+ */
+uniform sampler2D uEmissiveHi;
+uniform sampler2D uOcclusionHi;
+/// 1 when the hi-res pair above is live, 0 when the lighting already runs at 1:1.
+uniform float uUpscale;
 
 uniform vec2 uSceneSize;
 /**
@@ -397,12 +409,14 @@ void main() {
     // nothing here should ever be allowed to slide into a coarser level.
     vec3 irradiance = unmask(textureLod(uFluence, giUV, 0.0));
     vec4 albedo = texture(uAlbedo, vUV);
-    vec3 emissive = texture(uEmissive, giUV).rgb * uEmissiveScale * uEmissiveBoost;
+    bool hi = uUpscale > 0.5;
+    vec3 emissive = (hi ? texture(uEmissiveHi, vUV).rgb : texture(uEmissive, giUV).rgb)
+        * uEmissiveScale * uEmissiveBoost;
 
     // Occluding pixels get the dilated light instead of the cascades directly,
     // in proportion to how much they occlude, so a half-transparent caster gets
     // half of each.
-    float occ = texture(uOcclusion, giUV).a;
+    float occ = hi ? texture(uOcclusionHi, vUV).a : texture(uOcclusion, giUV).a;
     vec3 surface = uOccluderAmbient;
     if (occ > 0.002 && uLightStrength > 0.0) {
         float scale;

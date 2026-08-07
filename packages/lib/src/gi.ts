@@ -29,6 +29,11 @@ export interface RadianceCascadesOptions {
      * The buffers are square and a power of two, so what actually matters is
      * `max(width, height) * resolution` -- push it just over 512 and every buffer
      * jumps to 1024 and four times the memory. See the README.
+     *
+     * It costs sharpness of the *light* only. Below 1 the emission and occlusion
+     * are drawn a second time at the logical size, so emitters and occluder edges
+     * stay at game resolution however cheap the lighting is -- two more screen-
+     * sized buffers and two more passes over the tagged objects.
      * @default 0.5
      */
     resolution?: number;
@@ -186,6 +191,15 @@ export class RadianceCascades {
     private _emissive!: RenderTexture;
     private _occlusion!: RenderTexture;
     private _normal!: RenderTexture;
+    /**
+     * Emission and occlusion again, at albedo resolution with the albedo's own
+     * camera. The composite shows those two as objects rather than as light, so
+     * without them a lowered `resolution` would be visible in the final image as
+     * blocky emitters and stair-stepped occluder faces. `null` at `resolution >=
+     * 1`, where the lighting buffers already carry every pixel the screen has.
+     */
+    private _emissiveHi: RenderTexture | null = null;
+    private _occlusionHi: RenderTexture | null = null;
     /** The normal buffer holds something that still needs clearing. */
     private _normalDirty = true;
     /** Cascade `n`'s rays. Built bottom-up by ray extension, then merged top-down. */
@@ -284,7 +298,10 @@ export class RadianceCascades {
                 uOcclusion: RenderTexture.EMPTY.source,
                 uNormal: RenderTexture.EMPTY.source,
                 uFluence: RenderTexture.EMPTY.source,
+                uEmissiveHi: RenderTexture.EMPTY.source,
+                uOcclusionHi: RenderTexture.EMPTY.source,
                 compositeUniforms: {
+                    uUpscale: { value: 0, type: 'f32' },
                     uSceneSize: { value: f32(2), type: 'vec2<f32>' },
                     uViewSize: { value: f32(2), type: 'vec2<f32>' },
                     uGiOffset: { value: f32(2), type: 'vec2<f32>' },
@@ -366,6 +383,14 @@ export class RadianceCascades {
         this._occlusion = createTarget(extent, extent, 'rgba8unorm', 'nearest');
         this._normal = createTarget(extent, extent, 'rgba8unorm', 'linear');
         this._normalDirty = true;
+        // Same size and resolution as the albedo, so the three line up texel for
+        // texel and the composite reads all of them at `vUV`. Float for the
+        // emission, which is additive and HDR exactly as in the lighting buffer.
+        if (this._resolution < 1) {
+            const hi = { width: this._width, height: this._height, resolution: this._renderer.resolution };
+            this._emissiveHi = RenderTexture.create({ ...hi, format: 'rgba16float', antialias: false, scaleMode: 'linear' });
+            this._occlusionHi = RenderTexture.create({ ...hi, format: 'rgba8unorm', antialias: false, scaleMode: 'linear' });
+        }
         // Cascade n's rays: `2^n + 1` per plane, so a little wider than the
         // buffer. All of them are live at once -- extension fills them bottom-up
         // and merging then reads them top-down -- which is what makes this the
@@ -400,7 +425,10 @@ export class RadianceCascades {
         composite['uOcclusion'] = this._occlusion.source;
         composite['uNormal'] = this._normal.source;
         composite['uFluence'] = this._fluence.source;
+        composite['uEmissiveHi'] = (this._emissiveHi ?? this._emissive).source;
+        composite['uOcclusionHi'] = (this._occlusionHi ?? this._occlusion).source;
         const pu = composite['compositeUniforms'].uniforms;
+        pu['uUpscale'] = this._emissiveHi ? 1 : 0;
         setVec2(pu['uViewSize'], this._viewW, this._viewH);
         setVec2(pu['uSceneSize'], extent, extent);
         setVec2(pu['uMargin'], marginX, marginY);
@@ -472,6 +500,10 @@ export class RadianceCascades {
                 clearColor: [0, 0, 0, 0],
             });
         }
+        // No `transform`: the albedo's camera, so the composite reads it at vUV.
+        if (this._emissiveHi) {
+            renderer.render({ container: world, target: this._emissiveHi, clear: true, clearColor: [0, 0, 0, 0] });
+        }
         this._collector.restore();
 
         profiler?.begin('occlusion');
@@ -483,6 +515,9 @@ export class RadianceCascades {
             clear: true,
             clearColor: [0, 0, 0, 0],
         });
+        if (this._occlusionHi) {
+            renderer.render({ container: world, target: this._occlusionHi, clear: true, clearColor: [0, 0, 0, 0] });
+        }
         this._collector.restore();
 
         // A fourth pass over the world is only worth it once someone sets a
@@ -613,6 +648,8 @@ export class RadianceCascades {
             this._emissive,
             this._occlusion,
             this._normal,
+            this._emissiveHi,
+            this._occlusionHi,
             ...this._rays,
             this._coneA,
             this._coneB,
@@ -621,6 +658,8 @@ export class RadianceCascades {
             rt?.destroy(true);
         }
         this._rays = [];
+        this._emissiveHi = null;
+        this._occlusionHi = null;
     }
 }
 
