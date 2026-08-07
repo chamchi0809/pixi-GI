@@ -52,6 +52,15 @@ app.ticker.add(() => gi.render(), null, UPDATE_PRIORITY.HIGH);
 
 Move the camera by moving `world`; call `gi.resize(w, h)` on canvas resize.
 
+Since `world` is off the stage, PixiJS would not hit-test it. `enableWorldEvents`
+puts the pointer back:
+
+```ts
+enableWorldEvents(gi);
+torch.eventMode = "static";
+torch.on("pointertap", () => torch.blowOut());
+```
+
 Zooming works too — scale `world` — and the lighting follows it: `occluderLightRange`
 and `occluderLightHeight` are in world pixels, everything else is in the buffers
 and scales with them.

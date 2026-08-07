@@ -38,7 +38,30 @@ Move the camera by moving `world`, zoom by scaling it. Resize with `gi.resize(w,
 
 ## API
 
-That is the whole public surface — five exports.
+That is the whole public surface — six exports.
+
+### `enableWorldEvents(gi)`
+
+PixiJS hit-tests the stage, and the world is deliberately not on it, so out of
+the box nothing in the world sees a pointer. One call fixes that:
+
+```ts
+const detach = enableWorldEvents(gi);   // call `detach()` before gi.destroy()
+
+torch.eventMode = 'static';
+torch.cursor = 'pointer';
+torch.on('pointertap', () => torch.blowOut());
+```
+
+It puts a second `EventBoundary` over the world and feeds it the events landing
+on `gi.view`, which covers exactly the pixels the world was drawn into — so
+`eventMode`, `hitArea`, `cursor`, `click`, `pointerenter`, drag, and the rest
+behave as they always do, through the camera and the zoom. UI on the stage
+*above* `gi.view` still swallows pointers before the world sees them, which is
+what you want.
+
+The cost is one hit test per pointer event, and nothing at all if you never call
+it.
 
 ### `setMaterial(target, material)` / `getMaterial` / `clearMaterial`
 
@@ -246,7 +269,8 @@ Read this before shipping with it.
 - **`occlusionMap` reads alpha only** — its colour is ignored. `emissiveMap`
   uses colour × alpha × the `emissive` tint.
 - **The world container must not be on the stage.** Add `gi.view` instead. If
-  you add both you will render the scene twice.
+  you add both you will render the scene twice. Because of that, pointer events
+  reach the world only through `enableWorldEvents(gi)` — see above.
 - **`margin` is capped by the power-of-two rounding, not by what you ask for.**
   The buffers are square and already rounded up past the view, and the margin is
   the slack that rounding paid for — so it costs nothing, and asking for more than

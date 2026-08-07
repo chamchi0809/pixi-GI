@@ -1,5 +1,5 @@
 import { Application, Container, Text, UPDATE_PRIORITY } from "pixi.js";
-import { GpuProfiler, RadianceCascades } from "pixi-rcgi";
+import { GpuProfiler, RadianceCascades, enableWorldEvents } from "pixi-rcgi";
 import { keyOf } from "./keys";
 import { createPlatformerScene } from "./platformer";
 import { createSandScene } from "./sand/scene";
@@ -79,14 +79,18 @@ async function main(): Promise<void> {
   };
   applyScene(0);
   app.stage.addChild(gi.view);
+  // The world is off-stage, so pointers reach it only through the view.
+  let detachEvents = enableWorldEvents(gi);
 
   const setQuality = (next: number): void => {
     quality = next;
+    detachEvents();
     gi.destroy();
     gi = makeGI();
     gi.profiler = profiler;
     applyScene(index);
     app.stage.addChildAt(gi.view, 0);
+    detachEvents = enableWorldEvents(gi);
     profiler.reset();
     frames.length = 0;
   };
@@ -192,6 +196,7 @@ async function main(): Promise<void> {
   const gl = (app.renderer as { gl?: WebGL2RenderingContext }).gl;
   const info = gl?.getExtension("WEBGL_debug_renderer_info");
   (globalThis as Record<string, unknown>)["__gi"] = {
+    world,
     quality: (name: string) => {
       const next = QUALITY.findIndex((q) => q.name === name);
       if (next >= 0 && next !== quality) setQuality(next);

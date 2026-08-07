@@ -330,6 +330,11 @@ export class RadianceCascades {
         this.resize(options.width ?? renderer.screen.width, options.height ?? renderer.screen.height);
     }
 
+    /** The container being lit, as passed in. See `enableWorldEvents`. */
+    get world(): Container {
+        return this._world;
+    }
+
     /** Flat light added everywhere. */
     set ambient(value: ColorSource) {
         writeRgb(value, this._ambient);
@@ -556,6 +561,16 @@ export class RadianceCascades {
         pu['uLightStrength'] = this.occluderLightStrength;
         pu['uLightLod'] = this._lightLod;
         pu['uLightHeight'] = this._lightHeight;
+
+        // Rendering with a `transform` swaps it into the world's render group and
+        // leaves it there, so after the lighting passes `world.worldTransform` --
+        // and every child's, which is derived from it -- is the GI camera, margin
+        // and lattice snap included. Anything that reads a world transform back
+        // (hit testing, `toLocal`, `getGlobalPosition`) would get that instead of
+        // the game's camera, and which one depends on `resolution` and whether
+        // anything has a normal map. One matrix copy makes it always the game's.
+        world.renderGroup?.worldTransform.copyFrom(world.localTransform);
+
         profiler?.poll();
     }
 

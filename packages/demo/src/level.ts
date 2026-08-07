@@ -1,5 +1,5 @@
 import { Container, Sprite, Texture } from "pixi.js";
-import { setMaterial } from "pixi-rcgi";
+import { clearMaterial, getMaterial, setMaterial } from "pixi-rcgi";
 
 export const TILE = 70;
 
@@ -142,13 +142,27 @@ export function buildLevel(tex: LevelTextures): Level {
           break;
 
         // --- emitters -----------------------------------------------------
-        case "T":
-          setMaterial(place(lights, tex.torch, col, row), {
+        case "T": {
+          const torch = place(lights, tex.torch, col, row);
+          const flame = {
             emissive: 0xffb347,
             emissiveIntensity: 0.8,
             occlusion: 0,
+          };
+          setMaterial(torch, flame);
+          // Click to snuff it out. The world is not on the stage, so this only
+          // works because `enableWorldEvents` is on -- it is the check that the
+          // pointer lands on the right sprite through the camera and the zoom.
+          torch.eventMode = "static";
+          torch.cursor = "pointer";
+          torch.on("pointertap", () => {
+            const lit = getMaterial(torch) !== undefined;
+            if (lit) clearMaterial(torch);
+            else setMaterial(torch, flame);
+            torch.alpha = lit ? 0.4 : 1;
           });
           break;
+        }
         case "l":
           setMaterial(place(lights, tex.lavaTop, col, row), {
             emissive: 0xff5a1e,
