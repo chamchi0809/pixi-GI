@@ -35,15 +35,6 @@ export interface GIMaterial {
      */
     emissiveMap?: Texture;
     /**
-     * Whether this emitter also feeds the occluder surface light, which
-     * approximates it by its **bounding box**. Set `false` for a large sprite
-     * whose light really comes from scattered pixels of an
-     * {@link GIMaterial.emissiveMap} -- otherwise it reads as one lamp the size
-     * of the sprite. The cascades are per-pixel either way.
-     * @default true
-     */
-    occluderLight?: boolean;
-    /**
      * Per-pixel occlusion. Swapped in for the object's texture during the
      * occlusion pass; only its **alpha** channel is read.
      */
@@ -53,7 +44,8 @@ export interface GIMaterial {
      * +Z out of the screen).
      *
      * Only the occluder surface light uses it — the cascades are a 2D
-     * simulation and have no notion of a surface facing. Swapped in for the
+     * simulation and have no notion of a surface facing, so the light direction
+     * it shades against is the gradient of the fluence field. Swapped in for the
      * object's texture during the normal pass, so it should be opaque wherever
      * the surface exists; its alpha is the "I have a normal here" mask.
      */
@@ -70,7 +62,6 @@ export interface ResolvedMaterial {
     readonly intensity: number;
     readonly occlusion: number;
     readonly emits: boolean;
-    readonly occluderLight: boolean;
     readonly occludes: boolean;
     readonly emissiveMap: Texture | undefined;
     readonly occlusionMap: Texture | undefined;
@@ -95,7 +86,6 @@ function resolve(material: GIMaterial): ResolvedMaterial {
         intensity,
         occlusion,
         emits: material.emissive !== undefined && intensity > 0 && (rgb[0] ?? 0) + (rgb[1] ?? 0) + (rgb[2] ?? 0) > 0,
-        occluderLight: material.occluderLight ?? true,
         occludes: occlusion > 0,
         emissiveMap: material.emissiveMap,
         occlusionMap: material.occlusionMap,
@@ -179,16 +169,12 @@ export class SceneCollector {
     /** Highest emissive intensity in the scene; the emission buffer is normalised by it. */
     maxIntensity = 1;
 
-    /** The emitting leaves, for the occluder surface light's point-light list. */
-    readonly emitters: { node: Container; material: ResolvedMaterial }[] = [];
-
     /** False when nothing in the scene has a normal map, so the normal pass can be skipped. */
     hasNormals = false;
 
     collect(root: Container): void {
         this._participants.length = 0;
         this._background.length = 0;
-        this.emitters.length = 0;
         this.maxIntensity = 1;
         this.hasNormals = false;
         this._walk(root, undefined, true);
@@ -207,9 +193,8 @@ export class SceneCollector {
 
         if (material && isRenderable(node)) {
             this._participants.push({ node, material });
-            if (material.emits) {
-                if (material.intensity > this.maxIntensity) this.maxIntensity = material.intensity;
-                if (material.occluderLight) this.emitters.push({ node, material });
+            if (material.emits && material.intensity > this.maxIntensity) {
+                this.maxIntensity = material.intensity;
             }
             if (material.normalMap) this.hasNormals = true;
             keep = true;

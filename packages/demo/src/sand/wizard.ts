@@ -85,9 +85,7 @@ interface Ember extends Shot {
 }
 
 /**
- * A flying wizard, in grid coordinates. He occludes -- so he throws a real
- * shadow -- and everything he emits is a small sprite, which is what the
- * occluder surface light wants (it approximates emitters by their bounds).
+ * A flying wizard, in grid coordinates. He occludes, so he throws a real shadow.
  */
 export class Wizard {
     readonly view = new Container();
@@ -175,7 +173,6 @@ export class Wizard {
             emissive: 0xffffff,
             emissiveIntensity: 5,
             occlusion: 0,
-            occluderLight: false,
         });
         this.shots.addChild(sprite);
         return { sprite, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1 };

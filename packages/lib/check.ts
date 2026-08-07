@@ -3,8 +3,7 @@
  * is pure logic rather than GPU output. `pnpm --filter pixi-rcgi check`
  */
 import assert from 'node:assert/strict';
-import { MAX_EXTENT, buildLayout, raysWidth } from './src/cascades.ts';
-import { LIGHT_FLOATS, packLight } from './src/lights.ts';
+import { MAX_EXTENT, buildLayout, raysWidth, snapStep } from './src/cascades.ts';
 
 for (const [w, h] of [
     [640, 360],
@@ -51,6 +50,21 @@ for (const [w, h] of [
         }
         // Cascade 0's two rays per plane is what the seed pass assumes.
         assert.equal(raysWidth(extent, 0), 2 * extent, `${label}: cascade 0 is two texels per plane`);
+
+        // The snap pushes the covered world up to a step off the view, so the
+        // margin has to still cover the view afterwards -- this is the whole reason
+        // the step is capped, and getting it wrong darkens a screen edge.
+        for (let lod = 1; lod <= Math.log2(extent); lod++) {
+            const step = snapStep(lod, marginX, marginY);
+            assert.equal(2 ** Math.log2(step), step, `${label}: step ${step} is a power of two`);
+            assert.ok(step <= 2 ** lod, `${label}: step never exceeds the mip it aligns`);
+            // `<=`, because the residual is strictly less than a step: the last
+            // fragment reads just inside the last texel, never past it.
+            if (!capped) {
+                assert.ok(marginX + w + step <= extent, `${label}: lod ${lod} stays inside across`);
+                assert.ok(marginY + h + step <= extent, `${label}: lod ${lod} stays inside down`);
+            }
+        }
     }
 }
 
@@ -68,46 +82,4 @@ assert.equal(buildLayout(640, 360, 0, 3).cascades, 3);
 assert.equal(buildLayout(640, 360, 0, 0).cascades, 1);
 assert.equal(buildLayout(640, 360, 0, 99).cascades, Math.log2(1024));
 
-// --- occluder surface lights -------------------------------------------------
-{
-    const out = new Float32Array(4 * LIGHT_FLOATS);
-    // Half-resolution lighting on an 800x600 screen, 100px of falloff.
-    const view = { width: 800, height: 600, sx: 0.5, sy: 0.5, range: 100, ox: 0, oy: 0 };
-    const orange = { r: 255, g: 128, b: 0, intensity: 2, occlusion: 1 };
-    const box = { minX: 100, minY: 100, maxX: 140, maxY: 180 };
-
-    assert.ok(packLight(box, orange, view, 0, out), 'an on-screen emitter gets a slot');
-    assert.deepEqual([...out.subarray(0, 3)], [60, 70, 20], 'centre and half-extent are in GI pixels');
-    // A solid caster stops the ray, so it emits its intensity once at the surface.
-    assert.equal(out[4], 2, 'colour is intensity-premultiplied');
-    assert.ok(Math.abs(out[5]! - (128 / 255) * 2) < 1e-6, 'colour keeps its hue');
-
-    // A glowing volume accumulates over its whole width instead -- 2 * 20 px
-    // here -- which is what keeps it as bright as the cascades make it.
-    packLight(box, { ...orange, occlusion: 0 }, view, 0, out);
-    assert.equal(out[4], 2 * 40, 'a non-occluding emitter emits over its traversal');
-    packLight(box, { ...orange, occlusion: 0.5 }, view, 0, out);
-    assert.equal(out[4], 2 * 20.5, 'a partial occluder lands between the two');
-
-    // The GI buffers are rasterised snapped to whole texels, so lights are
-    // shifted by the same residual -- position only, never the falloff radius.
-    packLight(box, orange, { ...view, ox: -0.5, oy: 0.25 }, 0, out);
-    assert.deepEqual([...out.subarray(0, 3)], [59.5, 70.25, 20], 'the grid offset moves the light');
-    packLight(box, orange, view, 0, out);
-
-    // Slots are LIGHT_FLOATS apart and do not tread on each other.
-    assert.ok(packLight({ ...box, minX: 300, maxX: 340 }, orange, view, 2, out));
-    assert.equal(out[2 * LIGHT_FLOATS], 160, 'slot 2 starts at its own offset');
-    assert.equal(out[0], 60, 'writing slot 2 leaves slot 0 alone');
-
-    // Off-screen but still within range of it: its falloff reaches the view.
-    assert.ok(packLight({ minX: -140, minY: 100, maxX: -99, maxY: 180 }, orange, view, 1, out));
-    // One pixel further out it cannot, and must not consume the slot.
-    out[LIGHT_FLOATS] = 12345;
-    assert.ok(!packLight({ minX: -200, minY: 100, maxX: -101, maxY: 180 }, orange, view, 1, out));
-    assert.ok(!packLight({ minX: 100, minY: 701, maxX: 140, maxY: 900 }, orange, view, 1, out));
-    assert.equal(out[LIGHT_FLOATS], 12345, 'a culled emitter writes nothing');
-}
-
 console.log('buffer layout ok');
-console.log('occluder light packing ok');

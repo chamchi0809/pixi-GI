@@ -15,8 +15,11 @@
  *    up along its length, and what is left of anything arriving behind it. One
  *    channel of transmittance rather than three, matching the library's
  *    single-channel occlusion.
- *  - Every fragment writes alpha, so blending must be off (or additive with the
- *    alpha ignored). Do not add a plain alpha blend to any of these passes.
+ *  - Every fragment writes alpha, so blending must be off. The one exception is
+ *    the resolve pass, which is additive and *depends* on alpha accumulating with
+ *    it -- that is where the free-space mask comes from. Do not add a plain alpha
+ *    blend to any of these passes, and do not let the resolve's `add` degrade to
+ *    `add-npm`, which would multiply its rgb by that mask a second time.
  */
 
 /** Shared fullscreen-quad vertex shader. `aPosition` is a unit quad; the mesh is scaled to the target. */
@@ -240,6 +243,12 @@ void main() {
  * than the full 2pi of directions -- each ray carries half of its cone's span
  * and the two halves belong to different cones -- so that, not 2pi, is the
  * divisor.
+ *
+ * Alpha carries free space and rgb is premultiplied by it, so the fluence buffer
+ * is a *masked* field: mip-averaging it averages only the pixels light could
+ * actually reach, which is what lets the composite dilate it into the occluders.
+ * See {@link COMPOSITE_FRAG}. A quarter of the mask each, so the four frustums
+ * sum to it rather than to four times it.
  */
 export const RESOLVE_FRAG = /* glsl */ `#version 300 es
 precision highp float;
@@ -247,110 +256,14 @@ in vec2 vUV;
 out vec4 finalColor;
 
 uniform sampler2D uCones;
+uniform sampler2D uOcclusion;
 uniform float uNorm;
 ${FRUSTUM}
 
 void main() {
     vec2 p = frustum(vUV * uExtent) + vec2(1.0, 0.0);
-    finalColor = vec4(texture(uCones, p / uExtent).rgb * uNorm, 1.0);
-}
-`;
-
-/**
- * Vertex shader for the deferred occluder light pass. One instance per emitter.
- *
- * `aPosition` is the shared unit quad; each instance expands it to the AABB of
- * its own falloff circle, so a fragment outside `uLightRange` is never
- * rasterised in the first place. That is the whole point of the deferred pass:
- * cost follows the area the lights actually cover, not pixels x lights, and
- * nothing caps the light count but the instance buffer.
- *
- * Positions are in GI pixel space directly -- the mesh is left at scale 1, and
- * `uProjectionMatrix` already maps target pixels to clip space.
- */
-export const LIGHT_VERTEX = /* glsl */ `#version 300 es
-in vec2 aPosition;
-/// Per instance: xy = centre in GI pixels, z = source half-extent, w unused.
-in vec4 aLight;
-/// Per instance: rgb = intensity-premultiplied colour.
-in vec4 aLightColor;
-
-uniform mat3 uProjectionMatrix;
-uniform mat3 uWorldTransformMatrix;
-uniform mat3 uTransformMatrix;
-uniform float uLightRange;
-
-out vec2 vPos;
-out vec3 vLight;
-out vec3 vColor;
-
-void main() {
-    vec2 p = aLight.xy + (aPosition * 2.0 - 1.0) * uLightRange;
-    mat3 mvp = uProjectionMatrix * uWorldTransformMatrix * uTransformMatrix;
-    gl_Position = vec4((mvp * vec3(p, 1.0)).xy, 0.0, 1.0);
-    vPos = p;
-    vLight = aLight.xyz;
-    vColor = aLightColor.rgb;
-}
-`;
-
-/**
- * One emitter's contribution to the *occluder surface light*: a second,
- * deliberately non-RC model for pixels that occlude. The cascades simulate
- * light travelling in the plane, so an occluder is permanently inside its own
- * shadow and its visible face gets nothing. Here those pixels are instead shaded
- * directly from the emitters, as point lights with distance falloff and an
- * optional normal map. It is unshadowed by design -- that is what makes it cheap.
- *
- * Blended additively into the light buffer, which the composite then reads once.
- * Alpha is 1 so the result is the same whether the blend resolves to `add` or
- * `add-npm`; only rgb is ever read back.
- */
-export const LIGHT_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vPos;
-in vec3 vLight;
-in vec3 vColor;
-out vec4 finalColor;
-
-uniform sampler2D uOcclusion;
-uniform sampler2D uNormal;
-uniform vec2 uSceneSize;
-uniform float uLightRange;
-uniform float uLightHeight;
-
-void main() {
-    vec2 uv = vPos / uSceneSize;
-    // Only occluding pixels use this model; everything else is lit by the cascades.
-    if (texture(uOcclusion, uv).a <= 0.002) discard;
-
-    vec2 delta = vLight.xy - vPos;
-    float dist = length(delta);
-    if (dist >= uLightRange) discard;
-
-    // 1/d, not 1/d^2: this is a 2D world. A source of half-extent r subtends
-    // 2r/d radians at distance d, and the composite averages radiance over the
-    // whole 2*pi, so it fills r/(pi*d) of the incoming light -- the same
-    // relationship the cascades arrive at by tracing. Clamping at r stops the
-    // singularity inside the emitter.
-    float radius = max(vLight.z, 1.0);
-    float atten = radius / (3.14159265 * max(dist, radius));
-    // Taper to exactly zero at uLightRange so a light never pops out.
-    float window = 1.0 - (dist * dist) / (uLightRange * uLightRange);
-    atten *= window * window;
-
-    // Clear colour is (0,0,0,0), which decodes to a harmless direction that the
-    // alpha mask then throws away.
-    vec4 nTex = texture(uNormal, uv);
-    vec3 n = normalize(vec3(nTex.r * 2.0 - 1.0, 1.0 - nTex.g * 2.0, nTex.b * 2.0 - 1.0));
-    // Wrap (half-Lambert) shading. A normalMap describes painted relief on a
-    // flat sprite, not real geometry, so it should add shape without making the
-    // surface darker on average than an un-mapped one -- and plain N.L would,
-    // since every light is nearly in the surface plane.
-    vec3 dir = normalize(vec3(delta, uLightHeight));
-    float ndl = mix(1.0, dot(n, dir) * 0.5 + 0.5, nTex.a);
-
-    finalColor = vec4(vColor * (atten * ndl), 1.0);
+    float mask = 1.0 - texture(uOcclusion, vUV).a;
+    finalColor = vec4(texture(uCones, p / uExtent).rgb * (uNorm * mask), mask * 0.25);
 }
 `;
 
@@ -358,8 +271,11 @@ void main() {
  * Shade the albedo with the resolved fluence. Rendered straight into the scene
  * graph, so it also does exposure + tone map.
  *
- * Occluding pixels take their light from `uLight` -- the buffer the deferred
- * light pass accumulated -- instead of the cascades. See {@link LIGHT_FRAG}.
+ * Occluding pixels are the awkward case: the cascades simulate light travelling
+ * *in the plane*, so an occluder sits permanently inside its own shadow and its
+ * visible face resolves to black. Rather than shade it from a second, non-RC
+ * light model, this reuses the cascades' own answer and simply fetches it from
+ * where light exists -- see {@link dilate}.
  */
 export const COMPOSITE_FRAG = /* glsl */ `#version 300 es
 precision highp float;
@@ -369,7 +285,7 @@ out vec4 finalColor;
 uniform sampler2D uAlbedo;
 uniform sampler2D uEmissive;
 uniform sampler2D uOcclusion;
-uniform sampler2D uLight;
+uniform sampler2D uNormal;
 uniform sampler2D uFluence;
 
 uniform vec2 uSceneSize;
@@ -393,20 +309,129 @@ uniform float uToneMap;
 uniform vec3 uAmbient;
 uniform vec3 uOccluderAmbient;
 uniform float uLightStrength;
+/// Coarsest fluence mip the occluder light may reach for -- occluderLightRange.
+uniform float uLightLod;
+uniform float uLightHeight;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+/**
+ * Undo the resolve pass' mask premultiply: the mean radiance of the *free* space
+ * in this tap, with the blocked part contributing nothing rather than black.
+ */
+vec3 unmask(vec4 s) {
+    return s.rgb / max(s.a, 1e-4);
+}
+
+/**
+ * One level of the chain, filtered wider than the hardware would.
+ *
+ * A mip tap is a box average locked to that level's grid, and bilinear between
+ * boxes is not a smooth enough reconstruction to hide the grid: the world scrolls
+ * under a fixed mip lattice, so a light crossing a boundary empties one box into
+ * the next, and every pixel reading those boxes blinks in step. Four bilinear taps
+ * at the corners of the level's own texel is a box of boxes -- quadratic rather
+ * than linear, so the seams flatten out and the reconstruction is near enough
+ * translation-invariant that camera motion stops showing.
+ */
+vec4 tap(vec2 uv, float l) {
+    vec2 d = exp2(l) * 0.5 / uSceneSize;
+    return 0.25 * (textureLod(uFluence, uv + d, l)
+        + textureLod(uFluence, uv - d, l)
+        + textureLod(uFluence, uv + vec2(d.x, -d.y), l)
+        + textureLod(uFluence, uv - vec2(d.x, -d.y), l));
+}
+
+/// Still mask-premultiplied: only ratios of it are ever used, and not dividing
+/// per tap is what keeps the gradient free of the pinch unmask can produce.
+float lodLuma(vec2 uv, float lod) {
+    return dot(tap(uv, lod).rgb, LUMA);
+}
+
+/**
+ * The occluder surface light, taken straight out of the fluence buffer.
+ *
+ * Because the resolve pass premultiplied fluence by free space and kept that mask
+ * in alpha, mip level l holds the light within a 2^l footprint already weighted by
+ * how much of that footprint light could reach. So summing levels and dividing the
+ * totals *once* is the mean radiance of whatever free space is in reach, with
+ * blocked pixels contributing nothing rather than black.
+ *
+ * Every level is summed, weighted towards the finest: a rim pixel is dominated by
+ * level 1 and keeps a crisp contact edge, while deep inside a wall the fine levels
+ * are empty, add nothing to either total, and the coarse ones take over on their
+ * own. Nothing anywhere picks *a* level, and that is the point -- a per-pixel
+ * choice of mip facets the surface along every boundary where the choice flips,
+ * and dividing per level pinches wherever that level's coverage is near zero.
+ * Both artefacts are of the reconstruction, not of the light.
+ *
+ * Everything the cascades did comes along -- shadowing, colour, bounce, and the
+ * correct 2D distance falloff, since that is already baked into the field being
+ * averaged. scale comes back as the coverage-weighted mean footprint: how far
+ * off the light that reached this pixel was found.
+ */
+vec3 dilate(vec2 uv, out float scale) {
+    vec3 light = vec3(0.0);
+    float cover = 0.0;
+    float span = 0.0;
+    float w = 1.0;
+    for (float l = 1.0; l <= uLightLod; l += 1.0) {
+        vec4 s = tap(uv, l);
+        light += s.rgb * w;
+        cover += s.a * w;
+        span += s.a * w * exp2(l);
+        // Halving per level: fine detail wins wherever it exists, and the coarse
+        // levels are left as the broad fill under it. Raise it for softer, flatter
+        // occluders, lower it for crisper contact light.
+        w *= 0.5;
+    }
+    scale = span / max(cover, 1e-4);
+    return light / max(cover, 1e-4);
+}
 
 void main() {
     // Where this fragment's world point sits in the lighting buffers.
     vec2 giUV = (vUV * uViewSize + uGiOffset + uMargin) / uSceneSize;
 
-    vec3 irradiance = texture(uFluence, giUV).rgb;
+    // Explicit lod 0: the buffer is mipmapped for the occluder light below, and
+    // nothing here should ever be allowed to slide into a coarser level.
+    vec3 irradiance = unmask(textureLod(uFluence, giUV, 0.0));
     vec4 albedo = texture(uAlbedo, vUV);
     vec3 emissive = texture(uEmissive, giUV).rgb * uEmissiveScale * uEmissiveBoost;
 
-    // Occluding pixels get the surface light instead of the cascades, in
-    // proportion to how much they occlude, so a half-transparent caster gets
-    // half of each model.
+    // Occluding pixels get the dilated light instead of the cascades directly,
+    // in proportion to how much they occlude, so a half-transparent caster gets
+    // half of each.
     float occ = texture(uOcclusion, giUV).a;
-    vec3 surface = uOccluderAmbient + texture(uLight, giUV).rgb * uLightStrength;
+    vec3 surface = uOccluderAmbient;
+    if (occ > 0.002 && uLightStrength > 0.0) {
+        float scale;
+        vec3 lit = dilate(giUV, scale);
+
+        // Clear colour is (0,0,0,0), whose alpha says "no normal here".
+        vec4 nTex = texture(uNormal, giUV);
+        if (nTex.a > 0.0) {
+            // Fluence is directionless, but the *gradient* of the dilated field
+            // points at where the light is, and scale is how far off it was
+            // found -- enough of a light vector to shade relief with. Read at the
+            // level that footprint belongs to, so the gradient is as smooth as the
+            // light it came from.
+            float lod = log2(max(scale, 2.0));
+            vec2 d = scale / uSceneSize;
+            vec2 g = vec2(
+                lodLuma(giUV + vec2(d.x, 0.0), lod) - lodLuma(giUV - vec2(d.x, 0.0), lod),
+                lodLuma(giUV + vec2(0.0, d.y), lod) - lodLuma(giUV - vec2(0.0, d.y), lod));
+            float len = length(g);
+            vec3 dir = normalize(vec3(len > 1e-8 ? g * (scale / len) : vec2(0.0), uLightHeight));
+            vec3 n = normalize(vec3(nTex.r * 2.0 - 1.0, 1.0 - nTex.g * 2.0, nTex.b * 2.0 - 1.0));
+            // Wrap (half-Lambert) shading. A normalMap describes painted relief
+            // on a flat sprite, not real geometry, so it should add shape without
+            // making the surface darker on average than an un-mapped one -- and
+            // plain N.L would, since the light is nearly in the surface plane.
+            lit *= mix(1.0, dot(n, dir) * 0.5 + 0.5, nTex.a);
+        }
+        surface += lit * uLightStrength;
+    }
     vec3 ambient = mix(uAmbient, surface, occ);
 
     vec3 color = albedo.rgb * (irradiance * uStrength + ambient) + emissive;

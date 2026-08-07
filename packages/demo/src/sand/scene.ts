@@ -128,9 +128,8 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
   const field = new Sprite(albedo.texture);
   // One sprite is the whole simulation: its own pixels are the albedo, and two
   // more buffers give it per-pixel occlusion and per-pixel emission. Lava and
-  // flame light the cave through the cascades, pixel by pixel -- `occluderLight`
-  // is off because the bounding-box approximation would read the field as one
-  // lamp the size of the screen.
+  // flame light the cave through the cascades, pixel by pixel -- and the rock
+  // faces get that same light back out of the fluence buffer.
   setMaterial(field, {
     occlusion: 1,
     occlusionMap: occlusion.texture,
@@ -140,11 +139,9 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
     // pixel it passes.
     emissiveIntensity: 7,
     emissiveMap: emission.texture,
-    occluderLight: false,
   });
 
-  // Torches: pixel art that *is* the emitter. Small enough that the occluder
-  // surface light's bounding box is honest, so they get a point light too.
+  // Torches: pixel art that *is* the emitter.
   const torchLayer = new Container();
   const torchSprites: { s: Sprite; frames: Texture[] }[] = [];
 

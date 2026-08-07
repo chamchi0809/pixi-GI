@@ -62,6 +62,26 @@ export function buildLayout(
     };
 }
 
+/**
+ * @internal
+ * Buffer texels the world is snapped onto, for an occluder light reading up to mip
+ * `lightLod`.
+ *
+ * A whole texel is all the cascades need. The occluder light needs more, because it
+ * reads mip boxes and those are locked to the buffer's own grid: unless the world
+ * lands on a multiple of the coarsest box read, the averaging window for a given
+ * rock pixel drifts through every phase of that grid as the camera pans, and its
+ * shading blinks. Landing on that multiple pins the phase instead.
+ *
+ * The snap only ever pushes the world *up*, so it is the far margin that has to
+ * absorb the step -- plus the one texel of slack the extent already carries. With
+ * no margin this is 1 texel, which is exactly what it used to do.
+ */
+export function snapStep(lightLod: number, marginX: number, marginY: number): number {
+    const room = Math.min(marginX, marginY) + 1;
+    return 2 ** Math.min(lightLod, Math.floor(Math.log2(room)));
+}
+
 function margin(view: number, extent: number, fraction: number): number {
     const room = Math.floor((extent - view - 1) / 2);
     return Math.max(0, Math.min(Math.round(view * fraction), room));

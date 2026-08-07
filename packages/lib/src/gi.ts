@@ -1,12 +1,10 @@
 import { Color, Matrix, Mesh, Geometry, RenderTexture, Shader } from 'pixi.js';
 import type { ColorSource, Container, Renderer, WebGLRenderer } from 'pixi.js';
-import { LightPass, Pass } from './pass';
+import { Pass } from './pass';
 import { SceneCollector } from './material';
 import { COMPOSITE_FRAG, EXTEND_FRAG, MERGE_FRAG, RESOLVE_FRAG, SEED_FRAG, VERTEX } from './shaders';
-import { buildLayout, raysWidth } from './cascades';
+import { buildLayout, raysWidth, snapStep } from './cascades';
 import type { HrcLayout } from './cascades';
-import { packLight } from './lights';
-import type { LightView } from './lights';
 import type { GpuProfiler } from './profile';
 
 /** Options for {@link RadianceCascades}. Everything except `renderer`/`world` has a sane default. */
@@ -78,16 +76,19 @@ export interface RadianceCascadesOptions {
      */
     occluderAmbient?: ColorSource;
     /**
-     * How far an emitter's *surface* light reaches, in world pixels -- logical
-     * pixels at zoom 1, and scaled with `world`'s own transform after that.
-     * Beyond it an occluding pixel gets only {@link RadianceCascadesOptions.occluderAmbient}.
+     * How far an occluding pixel may look for light, in world pixels -- logical
+     * pixels at zoom 1, and scaled with `world`'s own transform after that. It
+     * sets which fluence mip the surface light is taken from, so it is really
+     * "how deep into a wall does light get"; a pixel that finds none within it
+     * gets only {@link RadianceCascadesOptions.occluderAmbient}. Rounded to a
+     * power of two.
      * @default 256
      */
     occluderLightRange?: number;
     /**
-     * How far in front of the scene the emitters sit, in world pixels, when
-     * shading a `normalMap`. Small values graze the surface and exaggerate the
-     * relief; large values flatten it. Ignored without a normal map.
+     * How far in front of the scene the light sits, in world pixels, when shading
+     * a `normalMap`. Small values graze the surface and exaggerate the relief;
+     * large values flatten it. Ignored without a normal map.
      * @default 48
      */
     occluderLightHeight?: number;
@@ -129,9 +130,9 @@ export class RadianceCascades {
     /** Reinhard tone mapping. */
     toneMap: boolean;
 
-    /** How far an emitter's surface light reaches on occluders, in world pixels. */
+    /** How far into an occluder light reaches, in world pixels. */
     occluderLightRange: number;
-    /** Virtual z of the emitters when shading a `normalMap`, in world pixels. */
+    /** Virtual z of the light when shading a `normalMap`, in world pixels. */
     occluderLightHeight: number;
     /** Multiplier on the occluder surface light. `0` disables it. */
     occluderLightStrength: number;
@@ -158,7 +159,6 @@ export class RadianceCascades {
 
     private readonly _ambient = f32(3);
     private readonly _occluderAmbient = f32(3);
-    private readonly _lightView: LightView = { width: 0, height: 0, sx: 1, sy: 1, range: 0, ox: 0, oy: 0 };
     private _background: number[] = [0, 0, 0, 1];
 
     private readonly _resolution: number;
@@ -168,9 +168,12 @@ export class RadianceCascades {
     /** This frame's camera zoom, read off `world`'s transform. */
     private _zoom = 1;
 
-    /** What snapping the buffers to whole texels pushed them by. `[0, 1)`. */
+    /** What snapping the buffers onto the lattice pushed them by. `[0, step)`. */
     private _residualX = 0;
     private _residualY = 0;
+    /** This frame's occluder-light mip level and light height, in GI pixels. */
+    private _lightLod = 1;
+    private _lightHeight = 1;
 
     private _width = 0;
     private _height = 0;
@@ -190,16 +193,17 @@ export class RadianceCascades {
     /** Cones, ping-ponged down the hierarchy by the merge pass. */
     private _coneA!: RenderTexture;
     private _coneB!: RenderTexture;
-    /** All four frustums' cascade-0 cones, summed and normalised. */
+    /**
+     * All four frustums' cascade-0 cones, summed and normalised, premultiplied by
+     * free space with the mask in alpha. Mipmapped, which is what the composite
+     * dilates into the occluders -- see COMPOSITE_FRAG.
+     */
     private _fluence!: RenderTexture;
-    /** Accumulated occluder surface light, at lighting resolution. */
-    private _light!: RenderTexture;
 
     private readonly _seedPass: Pass;
     private readonly _extendPass: Pass;
     private readonly _mergePass: Pass;
     private readonly _resolvePass: Pass;
-    private readonly _lightPass: LightPass;
 
     private _destroyed = false;
 
@@ -262,6 +266,7 @@ export class RadianceCascades {
             RESOLVE_FRAG,
             {
                 uCones: RenderTexture.EMPTY.source,
+                uOcclusion: RenderTexture.EMPTY.source,
                 resolveUniforms: {
                     uExtent: { value: 1, type: 'f32' },
                     uFrustum: { value: 0, type: 'f32' },
@@ -271,23 +276,13 @@ export class RadianceCascades {
             'add',
         );
 
-        this._lightPass = new LightPass({
-            uOcclusion: RenderTexture.EMPTY.source,
-            uNormal: RenderTexture.EMPTY.source,
-            lightUniforms: {
-                uSceneSize: { value: f32(2), type: 'vec2<f32>' },
-                uLightRange: { value: 1, type: 'f32' },
-                uLightHeight: { value: 1, type: 'f32' },
-            },
-        });
-
         const compositeShader = Shader.from({
             gl: { vertex: VERTEX, fragment: COMPOSITE_FRAG, name: 'gi-composite' },
             resources: {
                 uAlbedo: RenderTexture.EMPTY.source,
                 uEmissive: RenderTexture.EMPTY.source,
                 uOcclusion: RenderTexture.EMPTY.source,
-                uLight: RenderTexture.EMPTY.source,
+                uNormal: RenderTexture.EMPTY.source,
                 uFluence: RenderTexture.EMPTY.source,
                 compositeUniforms: {
                     uSceneSize: { value: f32(2), type: 'vec2<f32>' },
@@ -302,6 +297,8 @@ export class RadianceCascades {
                     uAmbient: { value: this._ambient, type: 'vec3<f32>' },
                     uOccluderAmbient: { value: this._occluderAmbient, type: 'vec3<f32>' },
                     uLightStrength: { value: 1, type: 'f32' },
+                    uLightLod: { value: 1, type: 'f32' },
+                    uLightHeight: { value: 1, type: 'f32' },
                 },
             },
         });
@@ -381,9 +378,9 @@ export class RadianceCascades {
         this._coneA = createTarget(extent, extent, 'rgba16float', 'nearest');
         this._coneB = createTarget(extent, extent, 'rgba16float', 'nearest');
         // Linear, so the composite -- which runs at screen resolution -- gets
-        // smooth light rather than GI-res steps.
-        this._fluence = createTarget(extent, extent, 'rgba16float', 'linear');
-        this._light = createTarget(extent, extent, 'rgba16float', 'linear');
+        // smooth light rather than GI-res steps. Mipmapped as well, because the
+        // occluder surface light is a mask-weighted mip tap of this buffer.
+        this._fluence = createTarget(extent, extent, 'rgba16float', 'linear', true);
 
         this._seedPass.setTexture('uEmissive', this._emissive.source);
         this._seedPass.setTexture('uOcclusion', this._occlusion.source);
@@ -395,16 +392,13 @@ export class RadianceCascades {
         setVec2(mu['uTexSize'], extent, extent);
 
         this._resolvePass.resources['resolveUniforms'].uniforms['uExtent'] = extent;
-
-        this._lightPass.setTexture('uOcclusion', this._occlusion.source);
-        this._lightPass.setTexture('uNormal', this._normal.source);
-        setVec2(this._lightPass.resources['lightUniforms'].uniforms['uSceneSize'], extent, extent);
+        this._resolvePass.setTexture('uOcclusion', this._occlusion.source);
 
         const composite = this.view.shader!.resources;
         composite['uAlbedo'] = this._albedo.source;
         composite['uEmissive'] = this._emissive.source;
         composite['uOcclusion'] = this._occlusion.source;
-        composite['uLight'] = this._light.source;
+        composite['uNormal'] = this._normal.source;
         composite['uFluence'] = this._fluence.source;
         const pu = composite['compositeUniforms'].uniforms;
         setVec2(pu['uViewSize'], this._viewW, this._viewH);
@@ -440,22 +434,24 @@ export class RadianceCascades {
         // and height are given in world units, so this is what carries the zoom
         // over to it.
         this._zoom = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || 1;
+        this._measureLight();
         const sx = this._viewW / this._width;
         const sy = this._viewH / this._height;
         m.a *= sx;
         m.c *= sx;
         m.b *= sy;
         m.d *= sy;
-        // Onto whole texels. Every ray in the hierarchy starts and ends on a texel
+        // Onto the lattice. Every ray in the hierarchy starts and ends on a texel
         // centre, so a world rasterised half a texel off would slide across the
         // ray fan as the camera moves and pump the light over half the screen.
         // Everything that reads a buffer has to follow, or the fix trades one
         // flicker for another: `_residual` is how far the snap pushed the world,
-        // and both the light pass and the composite add it back.
+        // and the composite adds it back.
+        const step = snapStep(this._lightLod, this._layout.marginX, this._layout.marginY);
         const exactX = m.tx * sx;
         const exactY = m.ty * sy;
-        m.tx = Math.ceil(exactX);
-        m.ty = Math.ceil(exactY);
+        m.tx = Math.ceil(exactX / step) * step;
+        m.ty = Math.ceil(exactY / step) * step;
         this._residualX = m.tx - exactX;
         this._residualY = m.ty - exactY;
         // Then push the whole world in by one margin, so buffer texel 0 is that
@@ -506,14 +502,14 @@ export class RadianceCascades {
             this._collector.restore();
         }
 
-        profiler?.begin('light');
-        this._renderLights();
-
         // One stage for the whole hierarchy, not one per pass: it runs 4*(2N+1)
         // times a frame, and `begin` records a sample each time, so per-pass
         // timings would be dominated by the query overhead they are measuring.
         profiler?.begin('hrc');
         for (let i = this.repeat['hrc'] ?? 1; i > 0; i--) this._renderCascades();
+        // The occluder surface light is a mip tap of the fluence, so the chain has
+        // to be rebuilt after the resolve. One 512^2 RGBA16F reduction.
+        this._fluence.source.updateMipmaps();
 
         const pu = this.view.shader!.resources['compositeUniforms'].uniforms;
         setVec2(pu['uGiOffset'], this._residualX, this._residualY);
@@ -522,6 +518,9 @@ export class RadianceCascades {
         pu['uEmissiveBoost'] = this.emissiveBoost;
         pu['uEmissiveScale'] = this._collector.maxIntensity;
         pu['uToneMap'] = this.toneMap ? 1 : 0;
+        pu['uLightStrength'] = this.occluderLightStrength;
+        pu['uLightLod'] = this._lightLod;
+        pu['uLightHeight'] = this._lightHeight;
         profiler?.poll();
     }
 
@@ -581,50 +580,21 @@ export class RadianceCascades {
     }
 
     /**
-     * Accumulate every visible emitter into the occluder light buffer, one
-     * instanced quad each.
+     * The occluder surface light in GI pixels, from knobs given in world units.
      *
-     * At strength 0 the pass is skipped outright rather than cleared: the
-     * composite multiplies the buffer by the same strength, so whatever is left
-     * in it contributes nothing.
+     * `occluderLightRange` becomes the coarsest fluence mip the composite sums,
+     * so the knob keeps its meaning (how far light gets into an occluder). Capped
+     * at the top of the chain, and at least level 1, since level 0 is the
+     * occluder's own black pixel.
      */
-    private _renderLights(): void {
-        this.view.shader!.resources['compositeUniforms'].uniforms['uLightStrength'] =
-            this.occluderLightStrength;
-        if (this.occluderLightStrength <= 0) return;
-
+    private _measureLight(): void {
         // World units -> GI pixels: the camera zoom, then the lighting resolution.
-        // Zoomed in, a torch's surface light reaches further across the screen
-        // because it reaches the same distance across the *world*.
         const sx = (this._viewW / this._width) * this._zoom;
-        const lu = this._lightPass.resources['lightUniforms'].uniforms;
-        lu['uLightRange'] = Math.max(1, this.occluderLightRange * sx);
-        lu['uLightHeight'] = Math.max(0.001, this.occluderLightHeight * sx);
-
-        this._lightPass.run(this._renderer, this._light, this._packLights());
+        const lod = Math.round(Math.log2(Math.max(2, this.occluderLightRange * sx)));
+        this._lightLod = Math.min(Math.log2(this._layout.extent), Math.max(1, lod));
+        this._lightHeight = Math.max(0.001, this.occluderLightHeight * sx);
     }
 
-    /** Turn this frame's emitters into the light pass' instance buffer. */
-    private _packLights(): number {
-        const emitters = this._collector.emitters;
-        const out = this._lightPass.reserve(emitters.length);
-        const view = this._lightView;
-        view.width = this._width;
-        view.height = this._height;
-        view.sx = this._viewW / this._width;
-        view.sy = this._viewH / this._height;
-        // `bounds` is already on screen, so the cull needs the range there too.
-        view.range = this.occluderLightRange * this._zoom;
-        view.ox = this._residualX + this._layout.marginX;
-        view.oy = this._residualY + this._layout.marginY;
-
-        let n = 0;
-        for (let i = 0; i < emitters.length; i++) {
-            const { node, material } = emitters[i]!;
-            if (packLight(node.getBounds(), material, view, n, out)) n++;
-        }
-        return n;
-    }
 
     destroy(): void {
         if (this._destroyed) return;
@@ -633,7 +603,6 @@ export class RadianceCascades {
         this._extendPass.destroy();
         this._mergePass.destroy();
         this._resolvePass.destroy();
-        this._lightPass.destroy();
         this.view.destroy({ children: true });
         this._disposeTargets();
     }
@@ -648,7 +617,6 @@ export class RadianceCascades {
             this._coneA,
             this._coneB,
             this._fluence,
-            this._light,
         ]) {
             rt?.destroy(true);
         }
@@ -661,6 +629,7 @@ function createTarget(
     height: number,
     format: 'rgba16float' | 'rgba8unorm',
     scaleMode: 'nearest' | 'linear',
+    autoGenerateMipmaps = false,
 ): RenderTexture {
     return RenderTexture.create({
         width,
@@ -669,6 +638,7 @@ function createTarget(
         format,
         scaleMode,
         antialias: false,
+        autoGenerateMipmaps,
     });
 }
 

@@ -52,7 +52,6 @@ subtree**; tag a child to override it for that branch.
 | `occlusion` | `0..1`, default `1`. How much light the object blocks. `0` = a glow that does not cast shadows. |
 | `emissiveMap` | Per-pixel emission. Swapped in for the object's texture during the emission pass; colour *and* alpha shape the light. Scaled to the object's footprint. |
 | `occlusionMap` | Per-pixel occlusion. Swapped in during the occlusion pass; only its **alpha** is read. |
-| `occluderLight` | Default `true`. Set `false` to keep a big `emissiveMap` sprite out of the occluder surface light, which would otherwise read it as one lamp the size of the sprite. The cascades are per-pixel either way. |
 | `normalMap` | Per-pixel surface normal, OpenGL tangent space (+X right, +Y **up**). Used only by the occluder surface light — see below. |
 
 **`emissiveIntensity` is radiance per lighting pixel a ray travels through the
@@ -72,8 +71,8 @@ Required: `renderer`, `world`. Everything else has a default.
 | `margin` | `0.5` | Off-view world that still emits and occludes, as a fraction of the view per side. Free, but capped. See below. |
 | `ambient` | `0x000000` | Flat light added everywhere. |
 | `occluderAmbient` | `0x000000` | Flat light for pixels that occlude. See below. |
-| `occluderLightRange` | `256` | How far an emitter's *surface* light reaches, in world pixels. |
-| `occluderLightHeight` | `48` | Virtual z of the emitters when shading a `normalMap`, in world pixels. |
+| `occluderLightRange` | `256` | How far into an occluder light reaches, in world pixels. Rounded to a power of two. |
+| `occluderLightHeight` | `48` | Virtual z of the light when shading a `normalMap`, in world pixels. |
 | `occluderLightStrength` | `1` | Multiplier on the occluder surface light. `0` disables it. |
 | `strength` / `exposure` / `emissiveBoost` | `1` | Bounce light / pre-tonemap / how bright emitters draw. |
 | `toneMap` | `true` | Reinhard. |
@@ -122,71 +121,85 @@ occludes is therefore permanently inside its own shadow: the cascades deliver it
 almost nothing and a wall renders pure black. That is correct for the model and
 useless for a game.
 
-So occluders get a **second, deliberately non-RC light model**, run as a
-deferred pass. Every emitter also becomes a point light — position and size from
-its bounds, colour from its material — drawn as one additively blended instanced
-quad covering its falloff circle, into a light buffer the composite reads once.
-Each occluding pixel is therefore shaded directly from the emitters that can
-actually reach it, with distance falloff and an optional normal map:
+Rather than shade those pixels from a second, non-RC light model, they reuse the
+cascades' own answer and just **fetch it from where light exists**.
+
+The resolve pass premultiplies fluence by free space (`1 - occlusion`) and keeps
+that mask in alpha, so the fluence buffer is a *masked* field. Mipmap it, and mip
+level `l` holds the light within a `2^l` footprint already weighted by how much of
+that footprint light could reach. The composite sums every level and divides the
+totals **once**:
 
 ```
 occluder light = occluderAmbient
-               + occluderLightStrength * Σ emitter radiance * falloff(distance) * shading
+               + occluderLightStrength * (Σ w·rgb) / (Σ w·a) * shading,  w = 2^-l
 ```
 
-It is blended in by how much the pixel occludes, so a half-transparent caster
-gets half this and half the cascades.
+That is the mean radiance of whatever free space is in reach, with blocked pixels
+contributing nothing rather than black. A rim pixel is dominated by level 1 and
+keeps a crisp contact edge; deep inside a wall the fine levels are empty, add
+nothing to either total, and the coarse ones take over on their own. It is blended
+in by how much the pixel occludes, so a half-transparent caster gets half this and
+half the cascades.
+
+The buffers are snapped onto a lattice as coarse as the coarsest mip read (capped
+by the margin, which absorbs the offset), so a world point keeps a fixed phase
+inside every mip box as the camera pans. Without that the box grid is locked to the
+buffer while the world scrolls under it, and the averaging window for a given rock
+pixel cycles through every phase of the grid -- which is a blink, not a shadow.
+
+Each level is read as four bilinear taps at the corners of its own texel rather
+than one. A mip box is locked to the buffer's grid while the world scrolls under
+it, so for a given world point the averaging window drifts through every phase of
+that grid as the camera pans; one bilinear tap reconstructs that drift linearly and
+it shows as blinking. Four is a box of boxes -- quadratic, and near enough
+translation-invariant to sit still.
+
+**Nothing picks a level**, and that matters: a per-pixel choice of mip facets the
+surface along every boundary where the choice flips, and dividing per level pinches
+wherever that level's coverage is near zero. Both are artefacts of the
+reconstruction rather than of the light, and summing removes them.
 
 ```ts
 new RadianceCascades({
     renderer, world,
     ambient: 0x0a0d14,           // everything the cascades do reach
     occluderAmbient: 0x141821,   // the floor for walls, crates, anything occluding
-    occluderLightRange: 320,     // world px; falloff hits exactly zero here
-    occluderLightHeight: 44,     // how far in front of the wall the lights sit
+    occluderLightRange: 320,     // world px; how deep into a wall light gets
+    occluderLightHeight: 44,     // how far in front of the wall the light sits
 });
 
 setMaterial(wall, { occlusion: 1, normalMap: brickNormals });
 ```
 
-Falloff is **1/d, not 1/d²** — this is a 2D world. An emitter of half-extent
-`r` subtends `2r/d` radians at distance `d`, and the composite averages incoming
-radiance over the full 2π, so it fills `r / (π·d)` of it. That is the same
-relationship the cascades arrive at by actually tracing, which is what keeps the
-two models at the same brightness. It is tapered to exactly zero at
-`occluderLightRange` so a light never pops as it scrolls away, and clamped
-inside the emitter's own extent so a large glowing area is not a singularity at
-its centre.
+**What this buys** over shading occluders from a light list: shadowing, colour,
+bounce and the correct 2D `1/d` falloff all come along for free, because they are
+already baked into the field being averaged. A wall behind another wall stays
+dark. Emitters are per-pixel — an `emissiveMap` full of scattered embers lights
+the rock beside it as embers, not as one lamp the size of the sprite. There is no
+emitter list, no bounding-box approximation, no light count to cap, and no second
+model to keep in brightness agreement with the first. It costs four taps per
+level -- `4 * log2(occluderLightRange)` in the composite, plus 16 more for the
+normal-map gradient -- and one mip reduction of the fluence buffer per frame.
 
-`emissiveIntensity` means the same thing here as it does to the cascades —
-radiance per lighting pixel a ray travels through the body — so a solid caster
-emits it once and a glowing volume (`occlusion: 0`) accumulates it across its
-whole width. Tune emitters once; both models follow.
+`normalMap` is optional and per object. Fluence is directionless, but the
+*gradient* of the dilated field points at where the light is, and the mip
+footprint is its distance — enough of a light vector to shade relief with, and it
+follows real shadowed light rather than a straight line to an emitter. Shading is
+**wrap (half-Lambert)**, not plain `N·L`: a normal map here paints relief onto a
+flat sprite rather than describing real geometry, and since the light sits nearly
+in the surface plane, plain `N·L` would just make mapped surfaces darker than
+un-mapped ones. `occluderLightHeight` is the look knob — small grazes the surface
+and exaggerates the relief, large flattens it.
 
-`normalMap` is optional and per object. Without one you get pure distance
-falloff; with one, a torch carried past sweeps a highlight across the relief.
-Shading is **wrap (half-Lambert)**, not plain `N·L`: a normal map here paints
-relief onto a flat sprite rather than describing real geometry, and since every
-light sits nearly in the surface plane, plain `N·L` would just make mapped
-surfaces darker than un-mapped ones. `occluderLightHeight` is the look knob —
-small grazes the surface and exaggerates the relief, large flattens it.
+Set `occluderLightStrength: 0` to get flat behaviour (just `occluderAmbient`), or
+leave both at `0x000000` / `0` for pure silhouettes.
 
-Set `occluderLightStrength: 0` to get the old flat behaviour (just
-`occluderAmbient`), or leave both at `0x000000` / `0` for pure silhouettes.
-
-**This is a fake, and its limits are sharp:** it is unshadowed (a wall behind
-another wall is still lit), and it approximates each emitter by its bounding box
-rather than its `emissiveMap`. It exists to make surfaces readable, not to be
-correct. An emitter that does not survive that approximation — a full-screen
-sprite lit by scattered `emissiveMap` pixels, say — should set
-`occluderLight: false`.
-
-There is **no cap on the emitter count**. Because each light is its own quad, the
-pass costs the area the lights cover rather than pixels × lights, it runs at
-lighting resolution rather than screen resolution, and emitters whose falloff
-cannot reach the view are culled on the CPU before they are ever packed. The
-instance buffer doubles as needed, so hundreds of live lights are ordinary; what
-you pay for is overlapping light *area*, not light *count*.
+**The limits.** Light still does not travel *through* an occluder in the
+simulation, so this is a dilation, not a solve: a thick wall's interior is lit by
+the average of whatever is open around it, which is why `occluderLightRange` is a
+look knob and not a physical distance. The mip footprints are axis-aligned, so
+deep interiors are broad and soft by construction.
 
 ## Limitations
 
@@ -196,13 +209,14 @@ Read this before shipping with it.
   renderer. It also requires `EXT_color_buffer_float`; the constructor throws
   with a clear message when the device does not expose it.
 - **Three extra renders of your world per frame** (albedo, emission, occlusion),
-  plus one instanced draw for all occluder lights together and `4 * (2N + 1)`
-  fullscreen passes for the hierarchy — 76 at nine cascades. On a scene where
+  plus `4 * (2N + 1)` fullscreen passes for the hierarchy — 76 at nine cascades —
+  and one mip reduction of the fluence buffer. On a scene where
   PixiJS draw calls already dominate, expect roughly 3× that cost. A **fourth**
   render is added the moment anything in the scene has a `normalMap`.
-- **Occluders are not lit by the simulation.** They are lit by the separate,
-  unshadowed deferred surface model described above. If you need a wall to be
-  shadowed from a light by another wall, this is not it.
+- **Occluders are not lit by the simulation**, they are lit by the *dilation* of
+  it described above: the mean radiance of the free space nearest them. That
+  keeps the shadowing, but the interior of a thick wall is a broad average rather
+  than a solve.
 - **The scene graph is walked every frame** to collect participants, and
   `tint`/`alpha`/`blendMode`/`texture` are temporarily overridden on tagged
   nodes and restored afterwards. Cost is O(nodes in `world`). If you mutate
@@ -246,7 +260,8 @@ Read this before shipping with it.
   Probe spacing and ray reach are fixed in *buffer* pixels, so zooming out shows
   more world lit at the same screen sharpness rather than the same world lit more
   coarsely. `occluderLightRange` / `occluderLightHeight` are the two knobs in
-  world pixels, scaled by the zoom so a torch lights the same wall either way.
+  world pixels, scaled by the zoom so a torch lights the same wall either way
+  (the range as the mip level it rounds to).
 - **No sub-region / scrolling optimisation.** The lighting always covers the
   full logical size, re-rendered from scratch every frame; nothing is cached
   between frames.
