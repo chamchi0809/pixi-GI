@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>psl mesh material</title>
+<!-- Nothing to fetch: an absent favicon is a 404 the harness reads as an error. -->
+<link rel="icon" href="data:," />
+<!--
+    The mesh-material path, on whichever backend `?backend=` asks for.
+
+    `pnpm --filter pixi-psl check` compares the two languages as text; this is the
+    other half, and the only thing that proves a PSL vertex stage actually draws:
+    attribute locations matching the geometry, varyings arriving at the fragment
+    stage, Pixi's own transform uniforms reaching group 0 and 1, and the clip
+    position coming out the same in GLSL and WGSL.
+
+        node tools/compare.mjs --page material.html
+
+    It presents the `__gi` surface that harness drives. There is no simulation to
+    step -- one render at boot is the whole frame -- so the hooks are no-ops.
+-->
+<body style="margin: 0; background: #000">
+    <script type="module">
+        import { Application, Geometry, Mesh } from 'pixi.js';
+        import {
+            PslProgram,
+            float,
+            length,
+            max,
+            mvpMatrix,
+            patchRenderer,
+            position,
+            uv,
+            vec2,
+            vec3,
+            vec4,
+            vertexUV,
+        } from 'pixi-psl';
+
+        const backend = new URLSearchParams(location.search).get('backend') ?? 'webgl';
+        const app = new Application();
+        await app.init({
+            width: window.innerWidth,
+            height: window.innerHeight,
+            preference: backend,
+            background: 0x000000,
+            antialias: false,
+            autoStart: false,
+        });
+        patchRenderer(app.renderer);
+        document.body.append(app.canvas);
+
+        // One program, both stages in PSL, all of it through the built-in nodes for
+        // the names Pixi fixes: attributes in, a varying across, Pixi's transform
+        // uniforms, and a vec3 clip position PSL widens itself.
+        const p = new PslProgram('meshProbe');
+        const u = p.uniforms('probeUniforms', { uTint: { type: 'vec3', value: [1, 0.55, 0.25] } });
+
+        const shader = p.build({
+            vertex: () => {
+                uv.assign(vertexUV);
+                return mvpMatrix.mul(vec3(position, 1));
+            },
+            // Opaque on purpose: Pixi's pipeline is premultiplied, so a
+            // non-premultiplied alpha here would compare two interpretations
+            // rather than two backends.
+            // Three channels off three different quantities, so the frame is a
+            // picture rather than a one-dimensional ramp and a swapped or dropped
+            // varying component shows up as a colour shift.
+            fragment: () => {
+                const radial = max(float(1).sub(length(uv.sub(vec2(0.5))).mul(2)), 0);
+                return vec4(vec3(uv.x, uv.y, radial).mul(u.uTint), 1);
+            },
+        });
+
+        const size = Math.min(app.screen.width, app.screen.height) * 0.8;
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: [0, 0, size, 0, size, size, 0, size],
+                aUV: [0, 0, 1, 0, 1, 1, 0, 1],
+            },
+            indexBuffer: [0, 1, 2, 0, 2, 3],
+        });
+        const mesh = new Mesh({ geometry, shader });
+        // Off-centre and rotated, so a wrong `uTransformMatrix` cannot pass.
+        mesh.position.set(app.screen.width / 2, app.screen.height / 2);
+        mesh.pivot.set(size / 2);
+        mesh.rotation = 0.3;
+        app.stage.addChild(mesh);
+        app.render();
+
+        globalThis.__gi = {
+            hud() {},
+            scene() {},
+            step() {},
+            reset() {},
+            report: () => ({
+                gpu: backend,
+                stats: { cascades: 0 },
+                size: [app.screen.width, app.screen.height],
+            }),
+        };
+    </script>
+</body>

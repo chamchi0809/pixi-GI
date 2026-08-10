@@ -1,32 +1,48 @@
 /**
  * PSL -- pixi shader language.
  *
- * Write a fragment shader once, as TypeScript, and get GLSL 300 es and WGSL out
- * of it, wired into a PixiJS `Shader` with the resource names both backends
- * expect. The API follows three.js' TSL: nodes are expressions, methods chain,
- * and `If` / `Loop` / `.toVar()` are statements that run as the graph function
+ * Write a shader once, as TypeScript, and get GLSL 300 es and WGSL out of it,
+ * wired into a PixiJS `Shader` with the resource names both backends expect. The
+ * API follows three.js' TSL: nodes are expressions, methods chain, and `If` /
+ * `Loop` / `Switch` / `.toVar()` are statements that run as the graph function
  * runs.
  *
  *     const p = new PslProgram('tint');
  *     const u = p.uniforms('tintUniforms', { uTint: { type: 'vec3', value: [1, 0, 0] } });
  *     const src = p.texture('uSource');
  *     const shader = p.build(() => src.sample(uv).mul(vec4(u.uTint, 1.0)));
+ *
+ * With no vertex graph that is a fullscreen pass. Pass `build({ vertex, fragment })`
+ * to use the same program as a mesh material: `position`, `vertexUV`, `uv`,
+ * `mvpMatrix` and the rest are the names PixiJS already fixes, as nodes.
  */
-export type { PslTarget, PslType } from './types.ts';
+export type { PslArrayType, PslPrimitive, PslStructType, PslTarget, PslType } from './types.ts';
 export type { PslStage } from './builder.ts';
-export type { Operand } from './nodes.ts';
-export { PslNode, PslVar, PslBranch } from './nodes.ts';
+export type { Operand, PslStruct, PslSwizzle } from './nodes.ts';
+export { PslNode, PslVar, PslBranch, PslSwitch } from './nodes.ts';
 export {
     // constructors
     bool,
     int,
+    uint,
     float,
     vec2,
     vec3,
     vec4,
+    mat3,
+    mat4,
+    // composites
+    struct,
+    array,
+    arrayOf,
+    arrayVar,
     // statements
     If,
     Loop,
+    Break,
+    Continue,
+    Discard,
+    Switch,
     Fn,
     select,
     // math
@@ -54,6 +70,27 @@ export {
     step,
 } from './nodes.ts';
 export type { PslLoopOptions } from './nodes.ts';
-export { PslProgram, PslTexture, setTexture, uv } from './compile.ts';
-export type { PslUniform, PslUniformSpec, PslUniformNodes } from './compile.ts';
+export { PslProgram, PslAttribute, PslTexture, PslVarying, setTexture } from './compile.ts';
+export {
+    // the names PixiJS fixes, as nodes -- attributes, the varying, the two uniform blocks
+    position,
+    vertexUV,
+    vertexColor,
+    uv,
+    projectionMatrix,
+    worldMatrix,
+    worldColorAlpha,
+    resolution,
+    modelMatrix,
+    mvpMatrix,
+    tint,
+    roundPixels,
+} from './compile.ts';
+export type {
+    PslGraphs,
+    PslSources,
+    PslUniform,
+    PslUniformSpec,
+    PslUniformNodes,
+} from './compile.ts';
 export { patchRenderer } from './patch.ts';

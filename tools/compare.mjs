@@ -13,7 +13,7 @@
  * fixed dt, and both runs get the same window size. What is left is float
  * rounding, which is why the thresholds are ratios and not zero.
  *
- *     node tools/compare.mjs [--scene sand] [--frames 240] [--control]
+ *     node tools/compare.mjs [--scene sand] [--frames 240] [--control] [--page material.html]
  *
  * `--control` renders WebGL twice instead. Same script, same thresholds, and the
  * only thing it can measure is the scene's own run-to-run noise -- so it is what
@@ -40,6 +40,8 @@ const flag = (name, fallback) => {
     return i >= 0 ? args[i + 1] : fallback;
 };
 const SCENE = flag('scene', 'sand');
+/** Any page under the demo that presents `__gi` -- see `material.html`. */
+const PAGE = flag('page', '');
 const FRAMES = Number(flag('frames', 240));
 const PAIR = args.includes('--control') ? ['webgl', 'webgl'] : ['webgl', 'webgpu'];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -96,7 +98,7 @@ async function capture(port, backend) {
             deviceScaleFactor: 1,
             mobile: false,
         });
-        await page.send('Page.navigate', { url: `http://localhost:${PORT}/?backend=${backend}` });
+        await page.send('Page.navigate', { url: `http://localhost:${PORT}/${PAGE}?backend=${backend}` });
 
         for (let i = 0; i < 80 && !(await page.eval('!!globalThis.__gi').catch(() => false)); i++) {
             await sleep(250);
