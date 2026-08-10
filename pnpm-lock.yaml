@@ -22,11 +22,17 @@ importers:
     dependencies:
       pixi-rcgi:
         specifier: workspace:*
-        version: link:../../packages/lib
+        version: link:../lib
       pixi.js:
         specifier: 8.19.0
         version: 8.19.0
+      tweakpane:
+        specifier: ^4.0.5
+        version: 4.0.5
     devDependencies:
+      '@tweakpane/core':
+        specifier: ^2.0.5
+        version: 2.0.5
       typescript:
         specifier: 6.0.3
         version: 6.0.3
@@ -160,6 +166,9 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@tweakpane/core@2.0.5':
+    resolution: {integrity: sha512-punBgD5rKCF5vcNo6BsSOXiDR/NSs9VM7SG65QSLJIxfRaGgj54ree9zQW6bO3pNFf3AogiGgaNODUVQRk9YqQ==}
 
   '@tybys/wasm-util@0.10.3':
     resolution: {integrity: sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg==}
@@ -322,6 +331,9 @@ packages:
   tslib@2.8.1:
     resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
 
+  tweakpane@4.0.5:
+    resolution: {integrity: sha512-rxEXdSI+ArlG1RyO6FghC4ZUX8JkEfz8F3v1JuteXSV0pEtHJzyo07fcDG+NsJfN5L39kSbCYbB9cBGHyuI/tQ==}
+
   typescript@6.0.3:
     resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
@@ -452,6 +464,8 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@tweakpane/core@2.0.5': {}
 
   '@tybys/wasm-util@0.10.3':
     dependencies:
@@ -597,6 +611,8 @@ snapshots:
 
   tslib@2.8.1:
     optional: true
+
+  tweakpane@4.0.5: {}
 
   typescript@6.0.3: {}
 

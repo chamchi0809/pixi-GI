@@ -12,9 +12,11 @@
   },
   "dependencies": {
     "pixi-rcgi": "workspace:*",
-    "pixi.js": "8.19.0"
+    "pixi.js": "8.19.0",
+    "tweakpane": "^4.0.5"
   },
   "devDependencies": {
+    "@tweakpane/core": "^2.0.5",
     "typescript": "6.0.3",
     "vite": "8.2.0"
   }

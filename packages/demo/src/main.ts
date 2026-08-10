@@ -1,6 +1,6 @@
 import { Application, Container, Text, UPDATE_PRIORITY } from "pixi.js";
 import { GpuProfiler, RadianceCascades, enableWorldEvents } from "pixi-rcgi";
-import { keyOf } from "./keys";
+import { Pane } from "tweakpane";
 import { createPlatformerScene } from "./platformer";
 import { createSandScene } from "./sand/scene";
 import type { Scene } from "./scene";
@@ -27,26 +27,28 @@ async function main(): Promise<void> {
   // Only the active scene's root lives in here.
   const world = new Container();
 
-  // `resolution` is fixed at construction (it decides every buffer size), so
-  // switching quality means a new instance. Everything else is a runtime setter,
-  // so switching *scenes* does not.
-  const QUALITY = [
-    { name: "sharp", resolution: 0.5 },
-    { name: "fast", resolution: 0.25 },
-  ] as const;
-  let quality = 0; // "sharp"
-  let giEnabled = true;
-  let showDebug = true;
-  let exposure = 0.95;
-  let zoom = 1;
+  // `resolution` and `cascades` are fixed at construction (they decide every
+  // buffer size), so changing either means a new instance. Everything else is a
+  // runtime setter, so switching *scenes* does not.
+  const params = {
+    scene: 0,
+    gi: true,
+    hud: true,
+    resolution: 0.25,
+    /** 0 = as many cascades as the buffer holds. */
+    cascades: 0,
+    exposure: 0.95,
+    zoom: 1,
+  };
 
   const makeGI = (): RadianceCascades =>
     new RadianceCascades({
       renderer: app.renderer,
       world,
-      resolution: QUALITY[quality]!.resolution,
-      strength: giEnabled ? 1 : 0,
-      exposure,
+      resolution: params.resolution,
+      ...(params.cascades > 0 ? { cascades: params.cascades } : {}),
+      strength: params.gi ? 1 : 0,
+      exposure: params.exposure,
     });
 
   let gi = makeGI();
@@ -59,7 +61,7 @@ async function main(): Promise<void> {
 
   const applyScene = (next: number): void => {
     scenes[index]!.active = false;
-    index = next;
+    index = params.scene = next;
     const scene = scenes[index]!;
     scene.active = true;
     world.removeChildren();
@@ -69,7 +71,7 @@ async function main(): Promise<void> {
     // Walls are outside the cascades, so they get their own model: a dark
     // floor plus direct falloff from every emitter. Each scene wants its own.
     const l = scene.lighting;
-    gi.ambient = giEnabled ? l.ambient : l.ambientOff;
+    gi.ambient = params.gi ? l.ambient : l.ambientOff;
     gi.occluderAmbient = l.occluderAmbient;
     gi.occluderLightRange = l.occluderLightRange;
     gi.occluderLightHeight = l.occluderLightHeight;
@@ -82,8 +84,8 @@ async function main(): Promise<void> {
   // The world is off-stage, so pointers reach it only through the view.
   let detachEvents = enableWorldEvents(gi);
 
-  const setQuality = (next: number): void => {
-    quality = next;
+  /** Only for `resolution`/`cascades`; every other knob is a setter on the instance. */
+  const rebuild = (): void => {
     detachEvents();
     gi.destroy();
     gi = makeGI();
@@ -107,49 +109,57 @@ async function main(): Promise<void> {
   hud.position.set(12, 10);
   app.stage.addChild(hud);
 
-  const keys = new Set<string>();
-  let wasPressed = new Set<string>();
-  addEventListener("keydown", (e) => {
-    if (e.code === "Tab") e.preventDefault(); // it switches demos, not focus
-    keys.add(keyOf(e));
+  const pane = new Pane({ title: "debug" });
+  pane
+    .addBinding(params, "scene", {
+      options: Object.fromEntries(scenes.map((s, i) => [s.name, i])),
+    })
+    .on("change", (e) => {
+      if (e.value !== index) applyScene(e.value);
+    });
+  pane.addBinding(params, "gi", { label: "global illumination" }).on("change", (e) => {
+    gi.strength = e.value ? 1 : 0;
+    const l = scenes[index]!.lighting;
+    gi.ambient = e.value ? l.ambient : l.ambientOff;
   });
-  addEventListener("keyup", (e) => keys.delete(keyOf(e)));
-  addEventListener("blur", () => keys.clear());
-  const tapped = (key: string): boolean =>
-    keys.has(key) && !wasPressed.has(key);
+  pane.addBinding(params, "hud").on("change", (e) => {
+    hud.visible = e.value;
+  });
+  pane
+    .addBinding(params, "resolution", { min: 0.1, max: 1, step: 0.05 })
+    .on("change", (e) => {
+      if (e.last) rebuild();
+    });
+  pane
+    // The cap is the buffer's own top level; above it `cascades` is clamped, so
+    // the slider would silently stop moving the image.
+    .addBinding(params, "cascades", { min: 0, max: 11, step: 1, label: "cascades (0=auto)" })
+    .on("change", (e) => {
+      if (e.last) rebuild();
+    });
+  pane.addBinding(params, "exposure", { min: 0.1, max: 4, step: 0.01 }).on("change", (e) => {
+    gi.exposure = e.value;
+  });
+  pane.addBinding(params, "zoom", { min: 0.5, max: 3, step: 0.05 });
+  hud.visible = params.hud;
 
   app.ticker.add(
     (ticker) => {
       const dt = Math.min(ticker.deltaMS / 1000, 1 / 30);
       const scene = scenes[index]!;
-
-      if (tapped("tab")) applyScene((index + 1) % scenes.length);
-      if (tapped("g")) {
-        giEnabled = !giEnabled;
-        gi.strength = giEnabled ? 1 : 0;
-        gi.ambient = giEnabled
-          ? scene.lighting.ambient
-          : scene.lighting.ambientOff;
-      }
-      if (tapped("h")) showDebug = !showDebug;
-      if (tapped("q")) setQuality((quality + 1) % QUALITY.length);
-      if (keys.has("[")) exposure = Math.max(0.1, exposure - dt * 1.5);
-      if (keys.has("]")) exposure = Math.min(4, exposure + dt * 1.5);
-      if (keys.has("-")) zoom = Math.max(0.5, zoom - dt * 1.2);
-      if (keys.has("=")) zoom = Math.min(3, zoom + dt * 1.2);
-      gi.exposure = exposure;
-      wasPressed = new Set(keys);
-
       const view = app.renderer.screen;
       // Zoom lives on the GI world, which is where the lighting reads the camera
-      // from. The sand sim has no camera -- it fits itself to whatever view it is
-      // given -- so there is nothing there to zoom.
-      const scale = scene.camera ? zoom : 1;
+      // from. A camera-less scene fits itself to whatever view it is given, so it
+      // has to be told the *unzoomed* size -- shrink it too and the refit cancels
+      // the zoom out -- and then centred, since the scale grows it from 0,0.
+      const scale = params.zoom;
       world.scale.set(scale);
       const t0 = performance.now();
-      scenes[index]!.update(dt, view.width / scale, view.height / scale);
-      const camera = scenes[index]!.camera;
+      const camera = scene.camera;
+      const fit = camera ? scale : 1;
+      scene.update(dt, view.width / fit, view.height / fit);
       if (camera) world.position.set(camera.x * scale, camera.y * scale);
+      else world.position.set((view.width * (1 - scale)) / 2, (view.height * (1 - scale)) / 2);
       const t1 = performance.now();
       gi.resize(view.width, view.height);
       gi.render();
@@ -166,14 +176,12 @@ async function main(): Promise<void> {
       if (frames.length > 4096) frames.shift();
 
       const s = gi.stats;
-      hud.visible = showDebug;
       // Assigning `text` re-rasterises the canvas and re-uploads the texture, so
       // a hidden HUD must not be updated -- it is not free just because it is
-      // invisible, and it would show up in any profile taken with H pressed.
-      if (!showDebug) return;
+      // invisible, and it would show up in any profile taken with it off.
+      if (!hud.visible) return;
       hud.text = [
-        `TAB: demo [${scene.name}]    G: global illumination [${giEnabled ? "on" : "off"}]    [ ] exposure ${exposure.toFixed(2)}    - = zoom ${scale.toFixed(2)}x    H: hide`,
-        `Q: quality [${QUALITY[quality]!.name}]    ${s.cascades} cascades @ ${s.giWidth}x${s.giHeight}    ${ticker.FPS.toFixed(0)} fps`,
+        `${s.cascades} cascades @ ${s.giWidth}x${s.giHeight}    zoom ${scale.toFixed(2)}x    ${ticker.FPS.toFixed(0)} fps`,
         ...scene.status(),
       ].join("\n");
     },
@@ -197,18 +205,21 @@ async function main(): Promise<void> {
   const info = gl?.getExtension("WEBGL_debug_renderer_info");
   (globalThis as Record<string, unknown>)["__gi"] = {
     world,
-    quality: (name: string) => {
-      const next = QUALITY.findIndex((q) => q.name === name);
-      if (next >= 0 && next !== quality) setQuality(next);
-      return QUALITY[quality]!.name;
+    quality: (resolution: number, cascades = 0) => {
+      params.resolution = resolution;
+      params.cascades = cascades;
+      rebuild();
+      pane.refresh();
     },
     scene: (name: string) => {
       const next = scenes.findIndex((s) => s.name === name);
       if (next >= 0 && next !== index) applyScene(next);
+      pane.refresh();
       return scenes[index]!.name;
     },
     hud: (on: boolean) => {
-      showDebug = on;
+      hud.visible = params.hud = on;
+      pane.refresh();
     },
     reset: () => {
       profiler.reset();
@@ -227,7 +238,7 @@ async function main(): Promise<void> {
       gpu: info ? gl?.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl?.getParameter(gl.RENDERER),
       precise: profiler.precise,
       discarded: profiler.discarded,
-      quality: QUALITY[quality]!.name,
+      resolution: params.resolution,
       scene: scenes[index]!.name,
       size: [app.renderer.screen.width, app.renderer.screen.height],
       stats: gi.stats,

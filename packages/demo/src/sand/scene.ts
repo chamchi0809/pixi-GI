@@ -210,16 +210,12 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
   let casting = false;
   let painting = false;
   let pointer = { x: W / 2, y: H / 2 };
-  let scale = 1;
-  let offX = 0;
-  let offY = 0;
 
+  // Via the transform rather than the fit scale/offset by hand: `main` zooms the
+  // world this root sits in, and `toLocal` is the only mapping that knows about it.
   const toGrid = (e: PointerEvent): void => {
     const r = canvas.getBoundingClientRect();
-    pointer = {
-      x: (e.clientX - r.left - offX) / scale,
-      y: (e.clientY - r.top - offY) / scale,
-    };
+    pointer = root.toLocal({ x: e.clientX - r.left, y: e.clientY - r.top });
   };
 
   canvas.addEventListener("contextmenu", (e) => {
@@ -290,11 +286,9 @@ export function createSandScene(canvas: HTMLCanvasElement): Scene {
   let frame = 0;
 
   function update(dt: number, width: number, height: number): void {
-    scale = Math.max(width / W, height / H);
-    offX = (width - W * scale) / 2;
-    offY = (height - H * scale) / 2;
+    const scale = Math.max(width / W, height / H);
     root.scale.set(scale);
-    root.position.set(offX, offY);
+    root.position.set((width - W * scale) / 2, (height - H * scale) / 2);
 
     if (painting) {
       const mat = BRUSHES[brush]!;
