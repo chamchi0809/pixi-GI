@@ -110,13 +110,21 @@ console.log('buffer layout ok');
     (Shader as unknown as { from: unknown }).from = from;
     assert.equal(captured.length, 5);
 
-    for (const { gpu, resources } of captured) {
+    // The composite is the only one Pixi draws for us; the four before it are the
+    // internal passes, drawn straight through the encoder.
+    const composite = captured.length - 1;
+
+    for (const [i, { gpu, resources }] of captured.entries()) {
         const program = new GpuProgram({ vertex: gpu.vertex, fragment: gpu.fragment, name: gpu.name });
+        const managed = i === composite;
 
         // Pixi fills groups 0 and 1 itself, but only when it recognises those two
-        // declarations by name -- otherwise nothing knows where the quad goes.
-        assert.ok(program.autoAssignGlobalUniforms, `${gpu.name}: globalUniforms not detected`);
-        assert.ok(program.autoAssignLocalUniforms, `${gpu.name}: localUniforms not detected`);
+        // declarations by name -- otherwise nothing knows where the mesh goes. The
+        // internal passes must not declare them at all: nothing fills a group for a
+        // draw issued outside `renderer.render`, so a shader that asked for one
+        // would read zeroes. They bring their own vertex stage instead.
+        assert.equal(program.autoAssignGlobalUniforms, managed, `${gpu.name}: globalUniforms`);
+        assert.equal(program.autoAssignLocalUniforms, managed, `${gpu.name}: localUniforms`);
 
         // Resources are matched to bindings by name; unmatched ones are parked in
         // group 99 and never reach the shader.

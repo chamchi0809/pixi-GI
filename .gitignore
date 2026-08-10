@@ -2,3 +2,6 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+
+# tools/bench.mjs output -- captures and timings, regenerated per run
+.bench/

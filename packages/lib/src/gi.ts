@@ -520,33 +520,51 @@ export class RadianceCascades {
         const mu = this._mergePass.resources['mergeUniforms'].uniforms;
         const ru = this._resolvePass.resources['resolveUniforms'].uniforms;
 
+        // Sub-stage `repeat` keys, read once rather than per pass. Seeding,
+        // extending and merging each rewrite their whole target from inputs they
+        // do not touch, so running one of them twice leaves the frame identical
+        // and the extra time is that sub-stage's own cost -- the same trick
+        // `repeat` plays on the top-level stages, one level down. The resolve is
+        // the exception: it is additive, so repeating it doubles the light.
+        const seedRuns = this.repeat['seed'] ?? 1;
+        const extendRuns = this.repeat['extend'] ?? 1;
+        const mergeRuns = this.repeat['merge'] ?? 1;
+
         for (let frustum = 0; frustum < 4; frustum++) {
             su['uFrustum'] = frustum;
-            this._seedPass.run(renderer, this._rays[0]!);
+            for (let i = seedRuns; i > 0; i--) this._seedPass.run(renderer, this._rays[0]!);
 
-            for (let n = 1; n < cascades; n++) {
-                const prev = this._rays[n - 1]!;
-                this._extendPass.setTexture('uPrev', prev.source);
-                setVec2(eu['uPrevSize'], prev.width, extent);
-                setVec2(eu['uTexSize'], this._rays[n]!.width, extent);
-                eu['uInterval'] = 2 ** n;
-                this._extendPass.run(renderer, this._rays[n]!);
+            for (let i = extendRuns; i > 0; i--) {
+                for (let n = 1; n < cascades; n++) {
+                    const prev = this._rays[n - 1]!;
+                    this._extendPass.setTexture('uPrev', prev.source);
+                    setVec2(eu['uPrevInv'], 1 / prev.width, 1 / extent);
+                    setVec2(eu['uTexSize'], this._rays[n]!.width, extent);
+                    eu['uInterval'] = 2 ** n;
+                    this._extendPass.run(renderer, this._rays[n]!);
+                }
             }
 
             let read = this._coneB;
             let write = this._coneA;
-            for (let n = cascades - 1; n >= 0; n--) {
-                const rays = this._rays[n]!;
-                this._mergePass.setTexture('uRays', rays.source);
-                setVec2(mu['uRaysSize'], rays.width, extent);
-                mu['uInterval'] = 2 ** n;
-                // Nothing above the top cascade: a 1x1 texture puts every cone
-                // lookup outside it, which MERGE_FRAG reads as empty.
-                const top = n === cascades - 1;
-                this._mergePass.setTexture('uCones', top ? RenderTexture.EMPTY.source : read.source);
-                setVec2(mu['uConesSize'], top ? 1 : extent, top ? 1 : extent);
-                this._mergePass.run(renderer, write);
-                [read, write] = [write, read];
+            for (let i = mergeRuns; i > 0; i--) {
+                read = this._coneB;
+                write = this._coneA;
+                for (let n = cascades - 1; n >= 0; n--) {
+                    const rays = this._rays[n]!;
+                    this._mergePass.setTexture('uRays', rays.source);
+                    setVec2(mu['uRaysInv'], 1 / rays.width, 1 / extent);
+                    mu['uInterval'] = 2 ** n;
+                    mu['uInvInterval'] = 2 ** -n;
+                    // Nothing above the top cascade: a 1x1 texture puts every cone
+                    // lookup outside it, which MERGE_FRAG reads as empty.
+                    const top = n === cascades - 1;
+                    this._mergePass.setTexture('uCones', top ? RenderTexture.EMPTY.source : read.source);
+                    const coneInv = top ? 1 : 1 / extent;
+                    setVec2(mu['uConesInv'], coneInv, coneInv);
+                    this._mergePass.run(renderer, write);
+                    [read, write] = [write, read];
+                }
             }
 
             this._resolvePass.setTexture('uCones', read.source);

@@ -23,12 +23,12 @@
  *    blend to any of these passes, and do not let the resolve's `add` degrade to
  *    `add-npm`, which would multiply its rgb by that mask a second time.
  */
-import { PslProgram, uv } from 'pixi-psl';
+import { PslProgram, position, uv } from 'pixi-psl';
 import type { PslNode, PslTexture } from 'pixi-psl';
 import {
     If,
     Loop,
-    atan2,
+    atan,
     ceil,
     dot,
     exp2,
@@ -45,10 +45,33 @@ import {
     vec2,
     vec3,
     vec4,
+    ySign,
 } from 'pixi-psl';
 import type { Shader } from 'pixi.js';
 
 const f32 = (n: number): Float32Array => new Float32Array(n);
+
+/**
+ * The vertex stage the four internal passes share: a unit quad, straight to clip
+ * space, with no matrices in it at all.
+ *
+ * PSL's default quad goes through Pixi's projection and the mesh's own
+ * transform, which is what something living in the scene graph wants -- the
+ * composite does, and keeps it. A pass that always covers its whole render
+ * target gets nothing out of it but two uniform blocks for Pixi to fill and a
+ * transform to revalidate every time the quad is rescaled to a new target. A
+ * pass always covers its whole target, which projects 0..size onto -1..1, so the
+ * whole chain collapses to a doubling -- and with it goes the reason a pass had
+ * to be a `Mesh` inside a `Container` at all. See {@link Pass}.
+ *
+ * All of it except which way y runs, which the two backends disagree about and
+ * Pixi hides inside that projection; `ySign` is that difference, and skipping it
+ * costs you a vertically mirrored image on one backend only.
+ */
+const fullscreen = (): PslNode => {
+    uv.assign(position);
+    return vec4(position.mul(2).sub(1).mul(vec2(1, ySign)), 0, 1);
+};
 
 /// Fluence -> mean incoming radiance. See {@link resolveShader} for why it is pi, not 2pi.
 export const FLUENCE_NORM = 1 / Math.PI;
@@ -73,18 +96,28 @@ function frustum(u: { uExtent: PslNode; uFrustum: PslNode }, p: PslNode): PslNod
  * here, nothing blocked", so the hierarchy simply runs out at the edges instead
  * of needing a bounds test at every call site.
  *
- * `stride` is how many texels a plane occupies -- `interval + 1` for a ray
- * buffer, `1` for a cone buffer, whose index is the cone rather than the ray.
+ * `base` is the plane the ray belongs to and `stride` how many texels a plane
+ * occupies -- `interval + 1` for a ray buffer. A cone buffer holds one texel per
+ * cone with no plane spacing of its own, so it passes the probe's texel column
+ * as `base` and omits the stride. Every caller already knows the plane it is
+ * after; recovering it here from the probe's x cost a divide and a floor per
+ * call, and a merge fragment makes up to eight of them.
+ *
+ * `invSize` is 1/size, so normalising is a multiply rather than two more
+ * divides. Every lookup lands on a texel centre, half a texel clear of either
+ * bound -- four orders of magnitude more slack than a reciprocal's rounding --
+ * so the bounds test below is nowhere near the edge of flipping.
  */
 function fetch(
     tex: PslTexture,
-    size: PslNode,
-    probe: PslNode,
+    invSize: PslNode,
+    base: PslNode,
+    y: PslNode,
     index: PslNode,
-    interval: PslNode,
-    stride: PslNode,
+    stride?: PslNode,
 ): PslNode {
-    const p = vec2(floor(probe.x.div(interval)).mul(stride).add(index).add(0.5), probe.y).div(size);
+    const column = stride ? base.mul(stride).add(index) : base.add(index);
+    const p = vec2(column.add(0.5), y).mul(invSize);
     return select(floor(p).equal(vec2(0, 0)), tex.sample(p), vec4(0, 0, 0, 1));
 }
 
@@ -115,15 +148,18 @@ export function seedShader(): Shader {
         uEmissiveScale: { type: 'float', value: 1 },
     });
 
-    return p.build(() => {
-        const texel = uv.mul(u.uTexSize);
-        // Two texels per plane, one per ray, holding the same thing.
-        const plane = floor(texel.x.mul(0.5));
-        const scene = frustum(u, vec2(plane.add(0.5), texel.y)).div(u.uExtent);
-        return vec4(
-            emissive.sample(scene).rgb.mul(u.uEmissiveScale),
-            float(1).sub(occlusion.sample(scene).a),
-        );
+    return p.build({
+        vertex: fullscreen,
+        fragment: () => {
+            const texel = uv.mul(u.uTexSize);
+            // Two texels per plane, one per ray, holding the same thing.
+            const plane = floor(texel.x.mul(0.5));
+            const scene = frustum(u, vec2(plane.add(0.5), texel.y)).div(u.uExtent);
+            return vec4(
+                emissive.sample(scene).rgb.mul(u.uEmissiveScale),
+                float(1).sub(occlusion.sample(scene).a),
+            );
+        },
     });
 }
 
@@ -145,32 +181,44 @@ export function extendShader(): Shader {
     const p = new PslProgram('gi-extend');
     const prev = p.texture('uPrev');
     const u = p.uniforms('extendUniforms', {
-        uPrevSize: { type: 'vec2', value: f32(2) },
+        /// 1 / the child cascade's buffer size; see {@link fetch}.
+        uPrevInv: { type: 'vec2', value: f32(2) },
         uTexSize: { type: 'vec2', value: f32(2) },
         /// 2^n for the cascade being written. Its children are half this long.
         uInterval: { type: 'float', value: 1 },
     });
 
-    const extend = (probe: PslNode, lo: PslNode, hi: PslNode, interval: PslNode, stride: PslNode): PslNode => {
-        const far = probe.add(vec2(interval, interval.negate().add(lo.mul(2))));
-        return join(
-            fetch(prev, u.uPrevSize, probe, lo, interval, stride),
-            fetch(prev, u.uPrevSize, far, hi, interval, stride),
+    /**
+     * `child` is the first of the two child planes the parent spans and `y` the
+     * parent probe's row. The near half is read on that plane, the far half one
+     * plane on, at the row the ray has climbed to by then.
+     */
+    const extend = (child: PslNode, y: PslNode, lo: PslNode, hi: PslNode, half: PslNode, stride: PslNode): PslNode =>
+        join(
+            fetch(prev, u.uPrevInv, child, y, lo, stride),
+            fetch(prev, u.uPrevInv, child.add(1), y.add(half.negate().add(lo.mul(2))), hi, stride),
         );
-    };
 
-    return p.build(() => {
-        const texel = uv.mul(u.uTexSize);
-        const rays = u.uInterval.add(1);
-        const plane = floor(texel.x.div(rays));
-        const index = floor(texel.x.sub(plane.mul(rays)));
-        const probe = vec2(plane.mul(u.uInterval).add(0.5), texel.y).toVar();
+    return p.build({
+        vertex: fullscreen,
+        fragment: () => {
+            const texel = uv.mul(u.uTexSize);
+            const rays = u.uInterval.add(1);
+            const plane = floor(texel.x.div(rays));
+            const index = floor(texel.x.sub(plane.mul(rays)));
 
-        const child = u.uInterval.mul(0.5).toVar();
-        const stride = child.add(1);
-        const lower = floor(index.mul(0.5)).toVar();
-        const upper = ceil(index.mul(0.5)).toVar();
-        return mix(extend(probe, lower, upper, child, stride), extend(probe, upper, lower, child, stride), 0.5);
+            const half = u.uInterval.mul(0.5).toVar();
+            const stride = half.add(1);
+            // Child planes sit half as far apart, so plane p spans 2p and 2p + 1.
+            const child = plane.mul(2).toVar();
+            const lower = floor(index.mul(0.5)).toVar();
+            const upper = ceil(index.mul(0.5)).toVar();
+            return mix(
+                extend(child, texel.y, lower, upper, half, stride),
+                extend(child, texel.y, upper, lower, half, stride),
+                0.5,
+            );
+        },
     });
 }
 
@@ -200,51 +248,82 @@ export function mergeShader(): Shader {
     /// of the hierarchy: every lookup then falls outside it and reads as empty.
     const cones = p.texture('uCones');
     const u = p.uniforms('mergeUniforms', {
-        uRaysSize: { type: 'vec2', value: f32(2) },
-        uConesSize: { type: 'vec2', value: f32(2) },
+        /// 1 / this cascade's ray buffer size, and 1 / the cone buffer's; see {@link fetch}.
+        uRaysInv: { type: 'vec2', value: f32(2) },
+        uConesInv: { type: 'vec2', value: f32(2) },
         uTexSize: { type: 'vec2', value: f32(2) },
         uInterval: { type: 'float', value: 1 },
+        /// 1 / uInterval. A power of two, so multiplying by it is exact.
+        uInvInterval: { type: 'float', value: 1 },
     });
 
-    /** One bounding ray of cone "index", merged into the cone above it. */
-    const edge = (probe: PslNode, plane: PslNode, index: PslNode, side: number): PslNode => {
+    /**
+     * One bounding ray of cone "index", merged into the cone above it. `column`
+     * is the probe's texel column in a cone buffer -- `plane * uInterval`.
+     */
+    const edge = (plane: PslNode, y: PslNode, column: PslNode, index: PslNode, side: number): PslNode => {
         const cone = index.mul(2).add(side).toVar();
         const ray = index.add(side).toVar();
         const stride = u.uInterval.add(1);
         const align = float(2).sub(mod(plane, 2)).toVar();
-        const reach = vec2(u.uInterval, u.uInterval.negate().add(ray.mul(2))).toVar();
+        /// Rows the ray climbs over one interval of travel.
+        const rise = u.uInterval.negate().add(ray.mul(2)).toVar();
 
-        const lo = vec2(u.uInterval.mul(2), u.uInterval.mul(-2).add(cone.mul(2)));
-        const hi = vec2(u.uInterval.mul(2), u.uInterval.mul(-2).add(cone.add(1).mul(2)));
-        const wedge = atan2(hi.y, hi.x).sub(atan2(lo.y, lo.x)).mul(0.5).toVar();
+        /**
+         * Half the cone's angular span. Its two bounding directions share an x,
+         * so the difference of their arctangents collapses by the tangent
+         * subtraction identity to a single `atan(I / (I^2 + k(k + 1)))`, where k
+         * is the cone counted from straight ahead. k is a whole number, so
+         * `k(k + 1)` is never negative and the denominator never drops below
+         * I^2 -- the argument stays small and positive for every cone of every
+         * cascade, off the quadrant boundaries that make `atan2` the dearer
+         * call. Two of those per edge become one `atan`, and the cancellation of
+         * subtracting angles that agreed to three digits goes with them, so the
+         * weight lands more accurate than it was.
+         */
+        const off = cone.sub(u.uInterval).toVar();
+        const wedge = atan(u.uInterval.div(u.uInterval.mul(u.uInterval).add(off.mul(off.add(1)))))
+            .mul(0.5)
+            .toVar();
 
-        const r = fetch(rays, u.uRaysSize, probe, ray, u.uInterval, stride).toVar();
-        const far = fetch(cones, u.uConesSize, probe.add(reach.mul(align)), cone, float(1), float(1)).rgb.toVar();
+        const r = fetch(rays, u.uRaysInv, plane, y, ray, stride).toVar();
+        const far = fetch(
+            cones,
+            u.uConesInv,
+            column.add(u.uInterval.mul(align)),
+            y.add(rise.mul(align)),
+            cone,
+        ).rgb.toVar();
 
         const out = vec3(0).toVar();
         If(align.lessThan(1.5), () => {
             out.assign(r.rgb.mul(wedge).add(far.mul(r.a)));
         }).Else(() => {
-            const chained = join(r, fetch(rays, u.uRaysSize, probe.add(reach), ray, u.uInterval, stride)).toVar();
-            const near = fetch(cones, u.uConesSize, probe, cone, float(1), float(1)).rgb;
+            const chained = join(r, fetch(rays, u.uRaysInv, plane.add(1), y.add(rise), ray, stride)).toVar();
+            const near = fetch(cones, u.uConesInv, column, y, cone).rgb;
             out.assign(mix(chained.rgb.mul(wedge).add(far.mul(chained.a)), near, 0.5));
         });
         return out;
     };
 
-    return p.build(() => {
-        const texel = uv.mul(u.uTexSize);
-        const plane = floor(texel.x.div(u.uInterval)).toVar();
-        const index = floor(texel.x.sub(plane.mul(u.uInterval))).toVar();
-        const probe = vec2(plane.mul(u.uInterval).add(0.5), texel.y).toVar();
+    return p.build({
+        vertex: fullscreen,
+        fragment: () => {
+            const texel = uv.mul(u.uTexSize);
+            const plane = floor(texel.x.mul(u.uInvInterval)).toVar();
+            const index = floor(texel.x.sub(plane.mul(u.uInterval))).toVar();
+            const column = plane.mul(u.uInterval).toVar();
 
-        // Plane 0's rays would have to come from outside the buffer. The resolve
-        // pass reads one texel further in, so nothing ever looks here.
-        const out = vec4(0).toVar();
-        If(plane.greaterThanEqual(1), () => {
-            out.assign(vec4(edge(probe, plane, index, 0).add(edge(probe, plane, index, 1)), 1));
-        });
-        return out;
+            // Plane 0's rays would have to come from outside the buffer. The resolve
+            // pass reads one texel further in, so nothing ever looks here.
+            const out = vec4(0).toVar();
+            If(plane.greaterThanEqual(1), () => {
+                out.assign(
+                    vec4(edge(plane, texel.y, column, index, 0).add(edge(plane, texel.y, column, index, 1)), 1),
+                );
+            });
+            return out;
+        },
     });
 }
 
@@ -278,10 +357,13 @@ export function resolveShader(): Shader {
         uNorm: { type: 'float', value: FLUENCE_NORM },
     });
 
-    return p.build(() => {
-        const q = frustum(u, uv.mul(u.uExtent)).add(vec2(1, 0));
-        const mask = float(1).sub(occlusion.sample(uv).a).toVar();
-        return vec4(cones.sample(q.div(u.uExtent)).rgb.mul(u.uNorm.mul(mask)), mask.mul(0.25));
+    return p.build({
+        vertex: fullscreen,
+        fragment: () => {
+            const q = frustum(u, uv.mul(u.uExtent)).add(vec2(1, 0));
+            const mask = float(1).sub(occlusion.sample(uv).a).toVar();
+            return vec4(cones.sample(q.div(u.uExtent)).rgb.mul(u.uNorm.mul(mask)), mask.mul(0.25));
+        },
     });
 }
 

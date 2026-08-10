@@ -525,6 +525,8 @@ export const exp2 = builtin('exp2', first);
 export const log2 = builtin('log2', first);
 export const sin = builtin('sin', first);
 export const cos = builtin('cos', first);
+/** One-argument `atan`, i.e. the principal branch. Cheaper than {@link atan2}, which has quadrants to sort out. */
+export const atan = builtin('atan', first);
 export const normalize = builtin('normalize', first);
 export const min = builtin('min', (args) => combine(args[0]!.type, args[1]!.type));
 export const max = builtin('max', (args) => combine(args[0]!.type, args[1]!.type));

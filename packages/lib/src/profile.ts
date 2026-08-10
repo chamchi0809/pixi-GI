@@ -23,6 +23,9 @@ interface TimerExt {
 /** Samples kept per stage. A few seconds at any frame rate fits. */
 const WINDOW = 4096;
 
+/** Polls to wait on a stage that is not running before giving up its turn. */
+const STALL = 8;
+
 /** Milliseconds a stage took, summarised over the sample window. */
 export interface StageStats {
     mean: number;
@@ -51,7 +54,14 @@ export class GpuProfiler {
     private _cpuStart = 0;
     private _wallStart = 0;
     private _discarded = 0;
-    private _rotation = 0;
+    /** Index into {@link _order} of the stage whose turn it is to be measured. */
+    private _due = 0;
+    /** The due stage ran and was measured, so the turn is spent. */
+    private _spent = false;
+    /** `poll` calls since the due stage last ran, to get past one that never does. */
+    private _missed = 0;
+    /** The open stage is the one being measured, not merely the one that is open. */
+    private _measuring = false;
 
     constructor(renderer: Renderer) {
         const gl = (renderer as WebGLRenderer).gl as WebGL2RenderingContext | undefined;
@@ -83,7 +93,8 @@ export class GpuProfiler {
         // to tell a stage that is genuinely GPU-heavy from one whose timer query
         // is just absorbing a CPU gap.
         this._wallStart = performance.now();
-        if (name !== this._order[this._rotation % this._order.length]) return;
+        this._measuring = name === this._order[this._due];
+        if (!this._measuring) return;
 
         if (this._ext) {
             const query = this._pool.pop() ?? this._gl!.createQuery()!;
@@ -100,7 +111,9 @@ export class GpuProfiler {
         const name = this._active;
         this._active = null;
         this._pushTo(this._cpu, name, performance.now() - this._wallStart);
-        if (name !== this._order[this._rotation % this._order.length]) return;
+        if (!this._measuring) return;
+        this._measuring = false;
+        this._spent = true;
 
         if (this._ext) {
             this._gl!.endQuery(this._ext.TIME_ELAPSED_EXT);
@@ -116,10 +129,23 @@ export class GpuProfiler {
      * Call once at the end of the frame. Drains whatever results the GPU has
      * finished; queries are read back a few frames late, which is exactly why
      * this does not stall the pipeline the way `gl.finish()` does.
+     *
+     * Calling it more than once a frame is allowed and costs only the drain. The
+     * turn passes to the next stage when the stage whose turn it was has
+     * actually been measured, never merely because a poll came round. Left to
+     * step per call it would advance by however many times the host polls --
+     * with six stages and two polls a frame the odd-indexed ones never come up
+     * at all, and read as free rather than as unmeasured. A stage that stops
+     * running entirely (a conditional pass switched off) would stall the turn
+     * for good, so after {@link STALL} fruitless polls it is skipped.
      */
     poll(): void {
         this.end();
-        this._rotation++;
+        if (this._spent || ++this._missed > STALL) {
+            this._spent = false;
+            this._missed = 0;
+            this._due = (this._due + 1) % this._order.length;
+        }
         if (!this._ext) return;
 
         const gl = this._gl!;

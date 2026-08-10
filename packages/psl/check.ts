@@ -33,6 +33,7 @@ import {
     vertexUV,
     vec3,
     vec4,
+    ySign,
 } from './src/index.ts';
 
 // --- a fullscreen pass ----------------------------------------------------------
@@ -374,6 +375,16 @@ assert.match(
     /vec4<f32> = vec4<f32>\(\w+\.xy, 0\.0, 1\.0\);\n\s+out\.position = \w+;/,
     'wgsl widens the same way',
 );
+// A vertex graph that writes clip space itself has to flip y under WGSL and not
+// under GLSL, and getting it wrong shows up as a mirrored image on one backend
+// and a correct one on the other -- which is to say, only if you look.
+const flipped = flat.sources({
+    vertex: () => vec4(position.mul(2).sub(1).mul(vec2(1, ySign)), 0, 1),
+    fragment: () => vec4(1),
+});
+assert.match(flipped.glsl.vertex, /vec2\(1\.0, 1\.0\)/, 'glsl leaves y alone');
+assert.match(flipped.wgsl.vertex, /vec2<f32>\(1\.0, -1\.0\)/, 'wgsl flips y');
+
 assert.throws(
     () => flat.sources({ vertex: () => float(1), fragment: () => vec4(1) }),
     /vertex graph returns a position/,

@@ -21,7 +21,7 @@ import { Shader, Texture } from 'pixi.js';
 import type { TextureSource } from 'pixi.js';
 import { Builder, builder, runGraph } from './builder.ts';
 import type { PslStage } from './builder.ts';
-import { PslNode, node, vec4 } from './nodes.ts';
+import { PslNode, RefNode, node, vec4 } from './nodes.ts';
 import type { Operand } from './nodes.ts';
 import type { PslPrimitive, PslStructType, PslTarget, PslType } from './types.ts';
 import { declarator, typeName } from './types.ts';
@@ -240,6 +240,24 @@ export const roundPixels: PslNode = new GroupRef('float', 'localUniforms', 'uRou
  * lands where Pixi puts the mesh. The same product Pixi's own vertex shaders form.
  */
 export const mvpMatrix: PslNode = projectionMatrix.mul(worldMatrix).mul(modelMatrix);
+
+/**
+ * `+1` under GLSL and `-1` under WGSL: which way clip space y runs against the
+ * rows of the target being drawn into.
+ *
+ * The two APIs disagree about where row 0 of a framebuffer is -- bottom in
+ * OpenGL, top in WebGPU -- while agreeing that a texture is sampled from the
+ * top. PixiJS settles it in the projection matrix, and settles it differently
+ * per backend: `RenderTargetSystem` flips y for anything that is not a root
+ * target, and the WebGPU adaptor marks *every* render target root, so the flip
+ * is on under GLSL and off under WGSL. A vertex stage that goes through
+ * {@link mvpMatrix} inherits that for free and never has to know.
+ *
+ * One that writes its own clip position does have to know, and this is the sign
+ * it needs: `y * ySign` on a position already in -1..1 lands the first row of
+ * the target where the shader that samples it next will look for it.
+ */
+export const ySign: PslNode = new RefNode('float', '1.0', '-1.0');
 
 /** The shared fullscreen-quad vertex stage, used when a program declares no vertex graph. */
 const QUAD_GLSL = /* glsl */ `#version 300 es

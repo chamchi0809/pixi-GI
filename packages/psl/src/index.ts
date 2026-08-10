@@ -47,6 +47,7 @@ export {
     select,
     // math
     abs,
+    atan,
     atan2,
     ceil,
     clamp,
@@ -83,6 +84,7 @@ export {
     resolution,
     modelMatrix,
     mvpMatrix,
+    ySign,
     tint,
     roundPixels,
 } from './compile.ts';
