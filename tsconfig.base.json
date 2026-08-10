@@ -12,6 +12,12 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
+    // Workspace packages resolve to source, so `typecheck` works before anything
+    // has been built. The emitted d.ts still says `pixi-psl`.
+    "paths": {
+      "pixi-psl": ["./packages/psl/src/index.ts"],
+      "pixi-rcgi": ["./packages/lib/src/index.ts"]
+    },
     "useDefineForClassFields": true,
     "noEmit": true
   }

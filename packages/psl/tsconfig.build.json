@@ -7,9 +7,7 @@
     "declaration": true,
     "declarationMap": true,
     "rootDir": "src",
-    "outDir": "dist",
-    // The base config points `pixi-psl` at its source for `typecheck`; the d.ts
-    // emit has to see the built package instead, or psl's sources land here too.
-    "paths": {}
+    "rewriteRelativeImportExtensions": true,
+    "outDir": "dist"
   }
 }

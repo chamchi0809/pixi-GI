@@ -5,10 +5,16 @@ import { createPlatformerScene } from "./platformer";
 import { createSandScene } from "./sand/scene";
 import type { Scene } from "./scene";
 
+/** `preference` is fixed at `Application.init`, so switching backends means a reload. */
+const BACKEND_KEY = "gi.backend";
+
 async function main(): Promise<void> {
+  // `?backend=` wins, so the CDP harness can pick one without touching storage.
+  const query = new URLSearchParams(location.search).get("backend");
+  const backend = (query ?? localStorage.getItem(BACKEND_KEY)) === "webgpu" ? "webgpu" : "webgl";
   const app = new Application();
   await app.init({
-    preference: "webgl",
+    preference: backend,
     background: 0x05060a,
     antialias: false,
     resizeTo: window,
@@ -31,6 +37,7 @@ async function main(): Promise<void> {
   // buffer size), so changing either means a new instance. Everything else is a
   // runtime setter, so switching *scenes* does not.
   const params = {
+    backend,
     scene: 0,
     gi: true,
     hud: true,
@@ -110,6 +117,13 @@ async function main(): Promise<void> {
   app.stage.addChild(hud);
 
   const pane = new Pane({ title: "debug" });
+  pane
+    .addBinding(params, "backend", { options: { webgl: "webgl", webgpu: "webgpu" } })
+    .on("change", (e) => {
+      if (e.value === backend) return;
+      localStorage.setItem(BACKEND_KEY, e.value);
+      location.reload();
+    });
   pane
     .addBinding(params, "scene", {
       options: Object.fromEntries(scenes.map((s, i) => [s.name, i])),
@@ -200,11 +214,16 @@ async function main(): Promise<void> {
     UPDATE_PRIORITY.UTILITY,
   );
 
-  // Driven over CDP by `tools/profile.mjs`. Harmless in normal use.
+  /** Wall clock until `step` takes over. */
+  let clock = performance.now();
+
+  // Driven over CDP by the scripts in `tools/`. Harmless in normal use.
   const gl = (app.renderer as { gl?: WebGL2RenderingContext }).gl;
   const info = gl?.getExtension("WEBGL_debug_renderer_info");
   (globalThis as Record<string, unknown>)["__gi"] = {
     world,
+    /** Live handle, so a probe can poke a setter without one knob per experiment. */
+    instance: () => gi,
     quality: (resolution: number, cascades = 0) => {
       params.resolution = resolution;
       params.cascades = cascades;
@@ -220,6 +239,19 @@ async function main(): Promise<void> {
     hud: (on: boolean) => {
       hud.visible = params.hud = on;
       pane.refresh();
+    },
+    /**
+     * Take the clock off the wall: stop the ticker and advance it by hand, so a
+     * given frame count is the same simulation on any machine or backend.
+     */
+    // A whole number of milliseconds from zero, so that every delta the ticker
+    // computes is exactly `dt`: off a wall-clock baseline the subtraction lands a
+    // few ulps out, and a scene's fixed-step accumulator turns that into a whole
+    // step more or less of simulation.
+    step: (frames = 1, dt = 16) => {
+      app.ticker.stop();
+      clock = app.ticker.lastTime = 0;
+      for (let i = 0; i < frames; i++) app.ticker.update((clock += dt));
     },
     reset: () => {
       profiler.reset();

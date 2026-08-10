@@ -1,8 +1,10 @@
 /**
- * The one runnable check: the buffer layout is the only part of the library that
- * is pure logic rather than GPU output. `pnpm --filter pixi-rcgi check`
+ * The runnable checks: the buffer layout, and that every generated WGSL shader
+ * binds the way Pixi expects. `pnpm --filter pixi-rcgi check`
  */
 import assert from 'node:assert/strict';
+import { GpuProgram, Shader, UniformGroup, createUboElementsWGSL } from 'pixi.js';
+import type { UniformData } from 'pixi.js';
 import { MAX_EXTENT, buildLayout, raysWidth, snapStep } from './src/cascades.ts';
 
 for (const [w, h] of [
@@ -83,3 +85,73 @@ assert.equal(buildLayout(640, 360, 0, 0).cascades, 1);
 assert.equal(buildLayout(640, 360, 0, 99).cascades, Math.log2(1024));
 
 console.log('buffer layout ok');
+
+/**
+ * The WebGPU side of every shader, checked against Pixi's own WGSL parser rather
+ * than against what the generator thinks it wrote. All three failure modes here
+ * are silent at runtime -- a black frame, not an error.
+ *
+ * `Shader.from` is stubbed because it reaches for a GL context to sniff the
+ * fragment precision, which node has not got. Nothing below needs a device.
+ */
+{
+    const captured: { gpu: any; resources: Record<string, unknown> }[] = [];
+    const from = Shader.from;
+    (Shader as unknown as { from: unknown }).from = (o: any) => {
+        captured.push(o);
+        return o;
+    };
+    const s = await import('./src/shaders.ts');
+    s.seedShader();
+    s.extendShader();
+    s.mergeShader();
+    s.resolveShader();
+    s.compositeShader(new Float32Array(3), new Float32Array(3));
+    (Shader as unknown as { from: unknown }).from = from;
+    assert.equal(captured.length, 5);
+
+    for (const { gpu, resources } of captured) {
+        const program = new GpuProgram({ vertex: gpu.vertex, fragment: gpu.fragment, name: gpu.name });
+
+        // Pixi fills groups 0 and 1 itself, but only when it recognises those two
+        // declarations by name -- otherwise nothing knows where the quad goes.
+        assert.ok(program.autoAssignGlobalUniforms, `${gpu.name}: globalUniforms not detected`);
+        assert.ok(program.autoAssignLocalUniforms, `${gpu.name}: localUniforms not detected`);
+
+        // Resources are matched to bindings by name; unmatched ones are parked in
+        // group 99 and never reach the shader.
+        const bound = new Map<string, string>();
+        for (const [group, entries] of Object.entries(program.layout)) {
+            for (const name of Object.keys(entries)) bound.set(name, `${group}:${entries[name]}`);
+        }
+        for (const name of Object.keys(resources)) {
+            const at = bound.get(name);
+            assert.ok(at, `${gpu.name}: resource "${name}" matches no binding`);
+            assert.notEqual(at.split(':')[0], '99', `${gpu.name}: "${name}" fell into group 99`);
+        }
+        for (const [name, at] of bound) {
+            if (at.startsWith('0:') || at.startsWith('1:')) continue;
+            assert.ok(name in resources, `${gpu.name}: binding "${name}" (${at}) has no resource`);
+        }
+
+        // The struct text is the generator's, the byte offsets written into the
+        // buffer are Pixi's, and the two agree only as long as member order does.
+        for (const [name, res] of Object.entries(resources)) {
+            if (Object.getPrototypeOf(res) !== Object.prototype) continue;
+            const struct = program.structsAndGroups.structs.find((x) => x.name === `${name}_t`);
+            assert.ok(struct, `${gpu.name}: struct ${name}_t not parsed`);
+            // `name` is filled in by the UniformGroup constructor.
+            const group = new UniformGroup(res as Record<string, UniformData>);
+            const data = Object.values(group.uniformStructures) as UniformData[];
+            assert.deepEqual(
+                Object.keys(struct.members),
+                data.map((d) => d.name),
+                `${gpu.name}/${name}: struct order != uniform order`,
+            );
+            // Pixi's offsets follow the WGSL rules, so order equality is enough --
+            // this just fails loudly if a member type ever goes unrecognised.
+            createUboElementsWGSL(data);
+        }
+    }
+    console.log('wgsl bindings ok');
+}

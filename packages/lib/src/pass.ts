@@ -1,6 +1,6 @@
-import { Container, Geometry, Mesh, Shader } from 'pixi.js';
-import type { BLEND_MODES, Renderer, RenderTexture, TextureSource } from 'pixi.js';
-import { VERTEX } from './shaders';
+import { Container, Geometry, Mesh } from 'pixi.js';
+import type { BLEND_MODES, Renderer, RenderTexture, Shader, TextureSource } from 'pixi.js';
+import { setTexture } from 'pixi-psl';
 
 /** A fullscreen shader pass, drawn as a unit quad scaled to the target. */
 export class Pass {
@@ -11,11 +11,7 @@ export class Pass {
      */
     private readonly _root = new Container();
 
-    constructor(name: string, fragment: string, resources: Record<string, unknown>, blendMode?: BLEND_MODES) {
-        const shader = Shader.from({
-            gl: { vertex: VERTEX, fragment, name },
-            resources,
-        });
+    constructor(shader: Shader, blendMode?: BLEND_MODES) {
         const geometry = new Geometry({
             attributes: { aPosition: [0, 0, 1, 0, 1, 1, 0, 1] },
             indexBuffer: [0, 1, 2, 0, 2, 3],
@@ -30,8 +26,9 @@ export class Pass {
         return this.mesh.shader!.resources;
     }
 
+    /** Sampler included -- WebGPU binds one per texture, WebGL ignores it. */
     setTexture(name: string, source: TextureSource): void {
-        this.resources[name] = source;
+        setTexture(this.mesh.shader!, name, source);
     }
 
     /** `clear: false` accumulates into whatever is already there -- for the additive passes. */

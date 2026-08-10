@@ -1,0 +1,7 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src", "check.ts", "vite.config.ts"],
+  "compilerOptions": {
+    "allowImportingTsExtensions": true
+  }
+}

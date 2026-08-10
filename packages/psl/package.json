@@ -1,0 +1,32 @@
+{
+  "name": "pixi-psl",
+  "version": "0.1.0",
+  "description": "PSL -- a node-based shader language for PixiJS. Write once in TypeScript, run on WebGL (GLSL 300 es) and WebGPU (WGSL).",
+  "keywords": ["pixijs", "pixi", "shader", "glsl", "wgsl", "webgpu", "webgl", "tsl"],
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": ["dist", "README.md"],
+  "main": "./dist/pixi-psl.js",
+  "module": "./dist/pixi-psl.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/pixi-psl.js"
+    }
+  },
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "node --disable-warning=ExperimentalWarning --experimental-transform-types check.ts"
+  },
+  "peerDependencies": {
+    "pixi.js": "^8.6.0"
+  },
+  "devDependencies": {
+    "pixi.js": "8.19.0",
+    "typescript": "6.0.3",
+    "vite": "8.2.0"
+  }
+}

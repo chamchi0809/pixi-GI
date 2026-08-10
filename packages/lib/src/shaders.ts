@@ -1,16 +1,18 @@
 /**
- * All GLSL for the holographic-radiance-cascade pipeline.
+ * The whole holographic-radiance-cascade pipeline, written once in PSL and
+ * compiled to GLSL 300 es and WGSL together, so WebGL and WebGPU run the same
+ * program rather than two that have to be kept in step by hand.
  *
  * Conventions shared by every pass:
- *  - `vUV` is 0..1 across the render target, matching PixiJS' own sprite UV
- *    orientation, so reading and writing at the same `vUV` is an identity copy.
+ *  - `uv` is 0..1 across the render target, matching PixiJS' own sprite UV
+ *    orientation, so reading and writing at the same `uv` is an identity copy.
  *  - "GI pixel space" is the coordinate system of the emissive / occlusion
  *    buffers: a square `uExtent x uExtent` image of the world scaled by
  *    `RadianceCascadesOptions.resolution`, covering the view plus
  *    `RadianceCascadesOptions.margin` of world on every side.
  *  - Every cascade buffer is *right-facing*: planes run along x, rays travel
  *    towards +x. The four 90-degree frustums are the same passes over the same
- *    layout with the scene rotated underneath, which {@link FRUSTUM} does.
+ *    layout with the scene rotated underneath, which {@link frustum} does.
  *  - A ray is stored as `vec4(radiance, transmittance)` -- the light it picked
  *    up along its length, and what is left of anything arriving behind it. One
  *    channel of transmittance rather than three, matching the library's
@@ -21,22 +23,35 @@
  *    blend to any of these passes, and do not let the resolve's `add` degrade to
  *    `add-npm`, which would multiply its rgb by that mask a second time.
  */
+import { PslProgram, uv } from 'pixi-psl';
+import type { PslNode, PslTexture } from 'pixi-psl';
+import {
+    If,
+    Loop,
+    atan2,
+    ceil,
+    dot,
+    exp2,
+    float,
+    floor,
+    length,
+    log2,
+    max,
+    mix,
+    mod,
+    normalize,
+    select,
+    step,
+    vec2,
+    vec3,
+    vec4,
+} from 'pixi-psl';
+import type { Shader } from 'pixi.js';
 
-/** Shared fullscreen-quad vertex shader. `aPosition` is a unit quad; the mesh is scaled to the target. */
-export const VERTEX = /* glsl */ `#version 300 es
-in vec2 aPosition;
-out vec2 vUV;
+const f32 = (n: number): Float32Array => new Float32Array(n);
 
-uniform mat3 uProjectionMatrix;
-uniform mat3 uWorldTransformMatrix;
-uniform mat3 uTransformMatrix;
-
-void main() {
-    mat3 mvp = uProjectionMatrix * uWorldTransformMatrix * uTransformMatrix;
-    gl_Position = vec4((mvp * vec3(aPosition, 1.0)).xy, 0.0, 1.0);
-    vUV = aPosition;
-}
-`;
+/// Fluence -> mean incoming radiance. See {@link resolveShader} for why it is pi, not 2pi.
+export const FLUENCE_NORM = 1 / Math.PI;
 
 /**
  * Cascade memory <-> scene, for the frustum in `uFrustum`.
@@ -48,35 +63,35 @@ void main() {
  * and the resolve (scene -> memory). Texel centres map to texel centres, which
  * is what lets the seed sample the scene without any filtering error.
  */
-const FRUSTUM = /* glsl */ `
-uniform float uExtent;
-uniform float uFrustum;
-
-vec2 frustum(vec2 p) {
-    vec2 r = mix(p, p.yx, mod(uFrustum, 2.0));
-    return mix(r, uExtent - r, step(0.5, mod(uFrustum, 3.0)));
+function frustum(u: { uExtent: PslNode; uFrustum: PslNode }, p: PslNode): PslNode {
+    const r = mix(p, p.yx, mod(u.uFrustum, 2));
+    return mix(r, u.uExtent.sub(r), step(0.5, mod(u.uFrustum, 3)));
 }
-`;
 
 /**
- * One ray out of a cascade's buffer, and the front-to-back join that chains two
- * of them. Rays outside the buffer read as "nothing here, nothing blocked", so
- * the hierarchy simply runs out at the edges instead of needing a bounds test
- * at every call site.
+ * One ray out of a cascade's buffer. Rays outside the buffer read as "nothing
+ * here, nothing blocked", so the hierarchy simply runs out at the edges instead
+ * of needing a bounds test at every call site.
  *
  * `stride` is how many texels a plane occupies -- `interval + 1` for a ray
  * buffer, `1` for a cone buffer, whose index is the cone rather than the ray.
  */
-const FETCH = /* glsl */ `
-vec4 fetch(sampler2D tex, vec2 size, vec2 probe, float index, float interval, float stride) {
-    vec2 p = vec2(floor(probe.x / interval) * stride + index + 0.5, probe.y) / size;
-    return floor(p) == vec2(0.0) ? texture(tex, p) : vec4(0.0, 0.0, 0.0, 1.0);
+function fetch(
+    tex: PslTexture,
+    size: PslNode,
+    probe: PslNode,
+    index: PslNode,
+    interval: PslNode,
+    stride: PslNode,
+): PslNode {
+    const p = vec2(floor(probe.x.div(interval)).mul(stride).add(index).add(0.5), probe.y).div(size);
+    return select(floor(p).equal(vec2(0, 0)), tex.sample(p), vec4(0, 0, 0, 1));
 }
 
-vec4 join(vec4 near, vec4 far) {
-    return vec4(near.rgb + far.rgb * near.a, near.a * far.a);
+/** Front-to-back chaining of two rays. */
+function join(near: PslNode, far: PslNode): PslNode {
+    return vec4(near.rgb.add(far.rgb.mul(near.a)), near.a.mul(far.a));
 }
-`;
 
 /**
  * Cascade 0's rays, straight off the scene. Their interval is one pixel, so both
@@ -89,27 +104,28 @@ vec4 join(vec4 near, vec4 far) {
  * that emits without occluding still lights the room -- unlike a strict
  * volumetric model, where an emitter has to absorb to be visible.
  */
-export const SEED_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
+export function seedShader(): Shader {
+    const p = new PslProgram('gi-seed');
+    const emissive = p.texture('uEmissive');
+    const occlusion = p.texture('uOcclusion');
+    const u = p.uniforms('seedUniforms', {
+        uTexSize: { type: 'vec2', value: f32(2) },
+        uExtent: { type: 'float', value: 1 },
+        uFrustum: { type: 'float', value: 0 },
+        uEmissiveScale: { type: 'float', value: 1 },
+    });
 
-uniform sampler2D uEmissive;
-uniform sampler2D uOcclusion;
-uniform vec2 uTexSize;
-uniform float uEmissiveScale;
-${FRUSTUM}
-
-void main() {
-    vec2 texel = vUV * uTexSize;
-    // Two texels per plane, one per ray, holding the same thing.
-    float plane = floor(texel.x * 0.5);
-    vec2 uv = frustum(vec2(plane + 0.5, texel.y)) / uExtent;
-    finalColor = vec4(
-        texture(uEmissive, uv).rgb * uEmissiveScale,
-        1.0 - texture(uOcclusion, uv).a);
+    return p.build(() => {
+        const texel = uv.mul(u.uTexSize);
+        // Two texels per plane, one per ray, holding the same thing.
+        const plane = floor(texel.x.mul(0.5));
+        const scene = frustum(u, vec2(plane.add(0.5), texel.y)).div(u.uExtent);
+        return vec4(
+            emissive.sample(scene).rgb.mul(u.uEmissiveScale),
+            float(1).sub(occlusion.sample(scene).a),
+        );
+    });
 }
-`;
 
 /**
  * Ray extension: build cascade `n`'s rays out of cascade `n-1`'s, four child
@@ -125,41 +141,38 @@ void main() {
  * cascade 1 rather than at cascade 3 as the paper has it: more diffusion, and a
  * moving light stops crawling.
  */
-export const EXTEND_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
+export function extendShader(): Shader {
+    const p = new PslProgram('gi-extend');
+    const prev = p.texture('uPrev');
+    const u = p.uniforms('extendUniforms', {
+        uPrevSize: { type: 'vec2', value: f32(2) },
+        uTexSize: { type: 'vec2', value: f32(2) },
+        /// 2^n for the cascade being written. Its children are half this long.
+        uInterval: { type: 'float', value: 1 },
+    });
 
-uniform sampler2D uPrev;
-uniform vec2 uPrevSize;
-uniform vec2 uTexSize;
-/// 2^n for the cascade being written. Its children are half this long.
-uniform float uInterval;
-${FETCH}
+    const extend = (probe: PslNode, lo: PslNode, hi: PslNode, interval: PslNode, stride: PslNode): PslNode => {
+        const far = probe.add(vec2(interval, interval.negate().add(lo.mul(2))));
+        return join(
+            fetch(prev, u.uPrevSize, probe, lo, interval, stride),
+            fetch(prev, u.uPrevSize, far, hi, interval, stride),
+        );
+    };
 
-vec4 extend(vec2 probe, float lo, float hi, float interval, float stride) {
-    vec2 far = probe + vec2(interval, -interval + lo * 2.0);
-    return join(
-        fetch(uPrev, uPrevSize, probe, lo, interval, stride),
-        fetch(uPrev, uPrevSize, far, hi, interval, stride));
+    return p.build(() => {
+        const texel = uv.mul(u.uTexSize);
+        const rays = u.uInterval.add(1);
+        const plane = floor(texel.x.div(rays));
+        const index = floor(texel.x.sub(plane.mul(rays)));
+        const probe = vec2(plane.mul(u.uInterval).add(0.5), texel.y).toVar();
+
+        const child = u.uInterval.mul(0.5).toVar();
+        const stride = child.add(1);
+        const lower = floor(index.mul(0.5)).toVar();
+        const upper = ceil(index.mul(0.5)).toVar();
+        return mix(extend(probe, lower, upper, child, stride), extend(probe, upper, lower, child, stride), 0.5);
+    });
 }
-
-void main() {
-    vec2 texel = vUV * uTexSize;
-    float rays = uInterval + 1.0;
-    float plane = floor(texel.x / rays);
-    float index = floor(texel.x - plane * rays);
-    vec2 probe = vec2(plane * uInterval + 0.5, texel.y);
-
-    float child = uInterval * 0.5;
-    float lower = floor(index * 0.5);
-    float upper = ceil(index * 0.5);
-    finalColor = mix(
-        extend(probe, lower, upper, child, child + 1.0),
-        extend(probe, upper, lower, child, child + 1.0),
-        0.5);
-}
-`;
 
 /**
  * Merge cascade `n`'s rays into its cones, against the cones of cascade `n+1`.
@@ -179,56 +192,61 @@ void main() {
  * fluence interpolated *after* merging. Interpolating position instead, or
  * before, breaks the volumetrics outright.
  */
-export const MERGE_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
+export function mergeShader(): Shader {
+    const p = new PslProgram('gi-merge');
+    /// This cascade's rays.
+    const rays = p.texture('uRays');
+    /// Cascade n+1's cones. Bind a 1x1 texture with uConesSize = (1,1) at the top
+    /// of the hierarchy: every lookup then falls outside it and reads as empty.
+    const cones = p.texture('uCones');
+    const u = p.uniforms('mergeUniforms', {
+        uRaysSize: { type: 'vec2', value: f32(2) },
+        uConesSize: { type: 'vec2', value: f32(2) },
+        uTexSize: { type: 'vec2', value: f32(2) },
+        uInterval: { type: 'float', value: 1 },
+    });
 
-/// This cascade's rays.
-uniform sampler2D uRays;
-uniform vec2 uRaysSize;
-/// Cascade n+1's cones. Bind a 1x1 texture with uConesSize = (1,1) at the top
-/// of the hierarchy: every lookup then falls outside it and reads as empty.
-uniform sampler2D uCones;
-uniform vec2 uConesSize;
-uniform vec2 uTexSize;
-uniform float uInterval;
-${FETCH}
+    /** One bounding ray of cone "index", merged into the cone above it. */
+    const edge = (probe: PslNode, plane: PslNode, index: PslNode, side: number): PslNode => {
+        const cone = index.mul(2).add(side).toVar();
+        const ray = index.add(side).toVar();
+        const stride = u.uInterval.add(1);
+        const align = float(2).sub(mod(plane, 2)).toVar();
+        const reach = vec2(u.uInterval, u.uInterval.negate().add(ray.mul(2))).toVar();
 
-/** One bounding ray of cone "index", merged into the cone above it. */
-vec3 edge(vec2 probe, float plane, float index, float side) {
-    float cone = index * 2.0 + side;
-    float ray = index + side;
-    float stride = uInterval + 1.0;
-    float align = 2.0 - mod(plane, 2.0);
-    vec2 reach = vec2(uInterval, -uInterval + ray * 2.0);
+        const lo = vec2(u.uInterval.mul(2), u.uInterval.mul(-2).add(cone.mul(2)));
+        const hi = vec2(u.uInterval.mul(2), u.uInterval.mul(-2).add(cone.add(1).mul(2)));
+        const wedge = atan2(hi.y, hi.x).sub(atan2(lo.y, lo.x)).mul(0.5).toVar();
 
-    vec2 lo = vec2(2.0 * uInterval, -2.0 * uInterval + cone * 2.0);
-    vec2 hi = vec2(2.0 * uInterval, -2.0 * uInterval + (cone + 1.0) * 2.0);
-    float wedge = 0.5 * (atan(hi.y, hi.x) - atan(lo.y, lo.x));
+        const r = fetch(rays, u.uRaysSize, probe, ray, u.uInterval, stride).toVar();
+        const far = fetch(cones, u.uConesSize, probe.add(reach.mul(align)), cone, float(1), float(1)).rgb.toVar();
 
-    vec4 r = fetch(uRays, uRaysSize, probe, ray, uInterval, stride);
-    vec3 far = fetch(uCones, uConesSize, probe + align * reach, cone, 1.0, 1.0).rgb;
-    if (align < 1.5) return r.rgb * wedge + far * r.a;
+        const out = vec3(0).toVar();
+        If(align.lessThan(1.5), () => {
+            out.assign(r.rgb.mul(wedge).add(far.mul(r.a)));
+        }).Else(() => {
+            const chained = join(r, fetch(rays, u.uRaysSize, probe.add(reach), ray, u.uInterval, stride)).toVar();
+            const near = fetch(cones, u.uConesSize, probe, cone, float(1), float(1)).rgb;
+            out.assign(mix(chained.rgb.mul(wedge).add(far.mul(chained.a)), near, 0.5));
+        });
+        return out;
+    };
 
-    r = join(r, fetch(uRays, uRaysSize, probe + reach, ray, uInterval, stride));
-    vec3 near = fetch(uCones, uConesSize, probe, cone, 1.0, 1.0).rgb;
-    return mix(r.rgb * wedge + far * r.a, near, 0.5);
+    return p.build(() => {
+        const texel = uv.mul(u.uTexSize);
+        const plane = floor(texel.x.div(u.uInterval)).toVar();
+        const index = floor(texel.x.sub(plane.mul(u.uInterval))).toVar();
+        const probe = vec2(plane.mul(u.uInterval).add(0.5), texel.y).toVar();
+
+        // Plane 0's rays would have to come from outside the buffer. The resolve
+        // pass reads one texel further in, so nothing ever looks here.
+        const out = vec4(0).toVar();
+        If(plane.greaterThanEqual(1), () => {
+            out.assign(vec4(edge(probe, plane, index, 0).add(edge(probe, plane, index, 1)), 1));
+        });
+        return out;
+    });
 }
-
-void main() {
-    vec2 texel = vUV * uTexSize;
-    float plane = floor(texel.x / uInterval);
-    float index = floor(texel.x - plane * uInterval);
-    vec2 probe = vec2(plane * uInterval + 0.5, texel.y);
-
-    // Plane 0's rays would have to come from outside the buffer. The resolve
-    // pass reads one texel further in, so nothing ever looks here.
-    finalColor = plane < 1.0
-        ? vec4(0.0)
-        : vec4(edge(probe, plane, index, 0.0) + edge(probe, plane, index, 1.0), 1.0);
-}
-`;
 
 /**
  * One frustum's cascade-0 cones, un-rotated into the scene and added to the
@@ -239,7 +257,7 @@ void main() {
  * count it twice.
  *
  * `uNorm` turns fluence into mean incoming radiance, so `strength: 1` means
- * "as bright as the light actually arriving". The weights above sum to pi rather
+ * "as bright as the light actually arriving". The merge weights sum to pi rather
  * than the full 2pi of directions -- each ray carries half of its cone's span
  * and the two halves belong to different cones -- so that, not 2pi, is the
  * divisor.
@@ -247,25 +265,28 @@ void main() {
  * Alpha carries free space and rgb is premultiplied by it, so the fluence buffer
  * is a *masked* field: mip-averaging it averages only the pixels light could
  * actually reach, which is what lets the composite dilate it into the occluders.
- * See {@link COMPOSITE_FRAG}. A quarter of the mask each, so the four frustums
+ * See {@link compositeShader}. A quarter of the mask each, so the four frustums
  * sum to it rather than to four times it.
  */
-export const RESOLVE_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
+export function resolveShader(): Shader {
+    const p = new PslProgram('gi-resolve');
+    const cones = p.texture('uCones');
+    const occlusion = p.texture('uOcclusion');
+    const u = p.uniforms('resolveUniforms', {
+        uExtent: { type: 'float', value: 1 },
+        uFrustum: { type: 'float', value: 0 },
+        uNorm: { type: 'float', value: FLUENCE_NORM },
+    });
 
-uniform sampler2D uCones;
-uniform sampler2D uOcclusion;
-uniform float uNorm;
-${FRUSTUM}
-
-void main() {
-    vec2 p = frustum(vUV * uExtent) + vec2(1.0, 0.0);
-    float mask = 1.0 - texture(uOcclusion, vUV).a;
-    finalColor = vec4(texture(uCones, p / uExtent).rgb * (uNorm * mask), mask * 0.25);
+    return p.build(() => {
+        const q = frustum(u, uv.mul(u.uExtent)).add(vec2(1, 0));
+        const mask = float(1).sub(occlusion.sample(uv).a).toVar();
+        return vec4(cones.sample(q.div(u.uExtent)).rgb.mul(u.uNorm.mul(mask)), mask.mul(0.25));
+    });
 }
-`;
+
+/** Rec. 709 luma, for the gradient the occluder shading follows. */
+const LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 /**
  * Shade the albedo with the resolved fluence. Rendered straight into the scene
@@ -275,183 +296,193 @@ void main() {
  * *in the plane*, so an occluder sits permanently inside its own shadow and its
  * visible face resolves to black. Rather than shade it from a second, non-RC
  * light model, this reuses the cascades' own answer and simply fetches it from
- * where light exists -- see {@link dilate}.
- */
-export const COMPOSITE_FRAG = /* glsl */ `#version 300 es
-precision highp float;
-in vec2 vUV;
-out vec4 finalColor;
-
-uniform sampler2D uAlbedo;
-uniform sampler2D uEmissive;
-uniform sampler2D uOcclusion;
-uniform sampler2D uNormal;
-uniform sampler2D uFluence;
-/**
- * The same emission and occlusion, drawn at albedo resolution with the albedo's
- * own camera. Everything else the composite reads is light, which is allowed to
- * be soft, but these two are *the objects themselves* -- an emitter's own glow
- * and the mask that says which pixels get occluder shading -- so taking them
- * from the lighting buffers would show the resolution option as blocky emitters
- * and stair-stepped occluder edges. Only bound below 1:1; see uUpscale.
- */
-uniform sampler2D uEmissiveHi;
-uniform sampler2D uOcclusionHi;
-/// 1 when the hi-res pair above is live, 0 when the lighting already runs at 1:1.
-uniform float uUpscale;
-
-uniform vec2 uSceneSize;
-/**
- * GI pixels the lighting buffers are offset from the albedo: they are rasterised
- * snapped to whole texels, so that an emitter's footprint stays put in the world
- * as the camera moves, while the albedo uses the exact camera. Every lookup into
- * a lighting buffer is shifted by this to land on the world point this fragment
- * shows.
- */
-uniform vec2 uGiOffset;
-/// Where the view starts inside the buffers -- the off-view world the rays also see.
-uniform vec2 uMargin;
-/// The screen, in GI pixels. Smaller than uSceneSize, which the margin pads.
-uniform vec2 uViewSize;
-uniform float uStrength;
-uniform float uExposure;
-uniform float uEmissiveScale;
-uniform float uEmissiveBoost;
-uniform float uToneMap;
-uniform vec3 uAmbient;
-uniform vec3 uOccluderAmbient;
-uniform float uLightStrength;
-/// Coarsest fluence mip the occluder light may reach for -- occluderLightRange.
-uniform float uLightLod;
-uniform float uLightHeight;
-
-const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
-
-/**
- * Undo the resolve pass' mask premultiply: the mean radiance of the *free* space
- * in this tap, with the blocked part contributing nothing rather than black.
- */
-vec3 unmask(vec4 s) {
-    return s.rgb / max(s.a, 1e-4);
-}
-
-/**
- * One level of the chain, filtered wider than the hardware would.
+ * where light exists -- see `dilate` below.
  *
- * A mip tap is a box average locked to that level's grid, and bilinear between
- * boxes is not a smooth enough reconstruction to hide the grid: the world scrolls
- * under a fixed mip lattice, so a light crossing a boundary empties one box into
- * the next, and every pixel reading those boxes blinks in step. Four bilinear taps
- * at the corners of the level's own texel is a box of boxes -- quadratic rather
- * than linear, so the seams flatten out and the reconstruction is near enough
- * translation-invariant that camera motion stops showing.
+ * `ambient` and `occluderAmbient` are bound live: the caller keeps writing into
+ * those arrays and every bind re-uploads them.
  */
-vec4 tap(vec2 uv, float l) {
-    vec2 d = exp2(l) * 0.5 / uSceneSize;
-    return 0.25 * (textureLod(uFluence, uv + d, l)
-        + textureLod(uFluence, uv - d, l)
-        + textureLod(uFluence, uv + vec2(d.x, -d.y), l)
-        + textureLod(uFluence, uv - vec2(d.x, -d.y), l));
+export function compositeShader(ambient: Float32Array, occluderAmbient: Float32Array): Shader {
+    const p = new PslProgram('gi-composite');
+    const albedoTex = p.texture('uAlbedo');
+    const emissiveTex = p.texture('uEmissive');
+    const occlusionTex = p.texture('uOcclusion');
+    const normalTex = p.texture('uNormal');
+    const fluence = p.texture('uFluence');
+    /**
+     * The same emission and occlusion, drawn at albedo resolution with the albedo's
+     * own camera. Everything else the composite reads is light, which is allowed to
+     * be soft, but these two are *the objects themselves* -- an emitter's own glow
+     * and the mask that says which pixels get occluder shading -- so taking them
+     * from the lighting buffers would show the resolution option as blocky emitters
+     * and stair-stepped occluder edges. Only bound below 1:1; see uUpscale.
+     */
+    const emissiveHi = p.texture('uEmissiveHi');
+    const occlusionHi = p.texture('uOcclusionHi');
+
+    const u = p.uniforms('compositeUniforms', {
+        /// 1 when the hi-res pair above is live, 0 when the lighting already runs at 1:1.
+        uUpscale: { type: 'float', value: 0 },
+        uSceneSize: { type: 'vec2', value: f32(2) },
+        /// The screen, in GI pixels. Smaller than uSceneSize, which the margin pads.
+        uViewSize: { type: 'vec2', value: f32(2) },
+        /**
+         * GI pixels the lighting buffers are offset from the albedo: they are
+         * rasterised snapped to whole texels, so that an emitter's footprint stays
+         * put in the world as the camera moves, while the albedo uses the exact
+         * camera. Every lookup into a lighting buffer is shifted by this to land on
+         * the world point this fragment shows.
+         */
+        uGiOffset: { type: 'vec2', value: f32(2) },
+        /// Where the view starts inside the buffers -- the off-view world the rays also see.
+        uMargin: { type: 'vec2', value: f32(2) },
+        uStrength: { type: 'float', value: 1 },
+        uExposure: { type: 'float', value: 1 },
+        uEmissiveScale: { type: 'float', value: 1 },
+        uEmissiveBoost: { type: 'float', value: 1 },
+        uToneMap: { type: 'float', value: 1 },
+        uAmbient: { type: 'vec3', value: ambient },
+        uOccluderAmbient: { type: 'vec3', value: occluderAmbient },
+        uLightStrength: { type: 'float', value: 1 },
+        /// Coarsest fluence mip the occluder light may reach for -- occluderLightRange.
+        uLightLod: { type: 'float', value: 1 },
+        uLightHeight: { type: 'float', value: 1 },
+    });
+
+    /**
+     * Undo the resolve pass' mask premultiply: the mean radiance of the *free*
+     * space in this tap, with the blocked part contributing nothing rather than
+     * black.
+     */
+    const unmask = (s: PslNode): PslNode => s.rgb.div(max(s.a, 1e-4));
+
+    /**
+     * One level of the chain, filtered wider than the hardware would.
+     *
+     * A mip tap is a box average locked to that level's grid, and bilinear between
+     * boxes is not a smooth enough reconstruction to hide the grid: the world scrolls
+     * under a fixed mip lattice, so a light crossing a boundary empties one box into
+     * the next, and every pixel reading those boxes blinks in step. Four bilinear taps
+     * at the corners of the level's own texel is a box of boxes -- quadratic rather
+     * than linear, so the seams flatten out and the reconstruction is near enough
+     * translation-invariant that camera motion stops showing.
+     */
+    const tap = (at: PslNode, l: PslNode): PslNode => {
+        const d = exp2(l).mul(0.5).div(u.uSceneSize).toVar();
+        const flip = vec2(d.x, d.y.negate()).toVar();
+        return fluence
+            .sampleLod(at.add(d), l)
+            .add(fluence.sampleLod(at.sub(d), l))
+            .add(fluence.sampleLod(at.add(flip), l))
+            .add(fluence.sampleLod(at.sub(flip), l))
+            .mul(0.25);
+    };
+
+    /// Still mask-premultiplied: only ratios of it are ever used, and not dividing
+    /// per tap is what keeps the gradient free of the pinch unmask can produce.
+    const lodLuma = (at: PslNode, lod: PslNode): PslNode => dot(tap(at, lod).rgb, LUMA);
+
+    /**
+     * The occluder surface light, taken straight out of the fluence buffer.
+     *
+     * Because the resolve pass premultiplied fluence by free space and kept that mask
+     * in alpha, mip level l holds the light within a 2^l footprint already weighted by
+     * how much of that footprint light could reach. So summing levels and dividing the
+     * totals *once* is the mean radiance of whatever free space is in reach, with
+     * blocked pixels contributing nothing rather than black.
+     *
+     * Every level is summed, weighted towards the finest: a rim pixel is dominated by
+     * level 1 and keeps a crisp contact edge, while deep inside a wall the fine levels
+     * are empty, add nothing to either total, and the coarse ones take over on their
+     * own. Nothing anywhere picks *a* level, and that is the point -- a per-pixel
+     * choice of mip facets the surface along every boundary where the choice flips,
+     * and dividing per level pinches wherever that level's coverage is near zero.
+     * Both artefacts are of the reconstruction, not of the light.
+     *
+     * Everything the cascades did comes along -- shadowing, colour, bounce, and the
+     * correct 2D distance falloff, since that is already baked into the field being
+     * averaged. `scale` comes back as the coverage-weighted mean footprint: how far
+     * off the light that reached this pixel was found.
+     */
+    const dilate = (at: PslNode): { light: PslNode; scale: PslNode } => {
+        const light = vec3(0).toVar();
+        const cover = float(0).toVar();
+        const span = float(0).toVar();
+        const w = float(1).toVar();
+        Loop({ start: 1, end: u.uLightLod }, (l) => {
+            const s = tap(at, l).toVar();
+            light.assign(light.add(s.rgb.mul(w)));
+            cover.assign(cover.add(s.a.mul(w)));
+            span.assign(span.add(s.a.mul(w).mul(exp2(l))));
+            // Halving per level: fine detail wins wherever it exists, and the coarse
+            // levels are left as the broad fill under it. Raise it for softer, flatter
+            // occluders, lower it for crisper contact light.
+            w.assign(w.mul(0.5));
+        });
+        const total = max(cover, 1e-4).toVar();
+        return { light: light.div(total).toVar(), scale: span.div(total).toVar() };
+    };
+
+    return p.build(() => {
+        // Where this fragment's world point sits in the lighting buffers.
+        const giUV = uv.mul(u.uViewSize).add(u.uGiOffset).add(u.uMargin).div(u.uSceneSize).toVar();
+
+        // Explicit lod 0: the buffer is mipmapped for the occluder light below, and
+        // nothing here should ever be allowed to slide into a coarser level.
+        const irradiance = unmask(fluence.sampleLod(giUV, 0));
+        const albedo = albedoTex.sample(uv);
+        const hi = u.uUpscale.greaterThan(0.5);
+        const emissive = select(hi, emissiveHi.sample(uv).rgb, emissiveTex.sample(giUV).rgb)
+            .mul(u.uEmissiveScale)
+            .mul(u.uEmissiveBoost);
+
+        // Occluding pixels get the dilated light instead of the cascades directly,
+        // in proportion to how much they occlude, so a half-transparent caster gets
+        // half of each.
+        const occ = select(hi, occlusionHi.sample(uv).a, occlusionTex.sample(giUV).a).toVar();
+        const surface = u.uOccluderAmbient.toVar();
+        If(occ.greaterThan(0.002).and(u.uLightStrength.greaterThan(0)), () => {
+            const { light, scale } = dilate(giUV);
+            const lit = light.toVar();
+
+            // Clear colour is (0,0,0,0), whose alpha says "no normal here".
+            const nTex = normalTex.sample(giUV).toVar();
+            If(nTex.a.greaterThan(0), () => {
+                // Fluence is directionless, but the *gradient* of the dilated field
+                // points at where the light is, and scale is how far off it was
+                // found -- enough of a light vector to shade relief with. Read at the
+                // level that footprint belongs to, so the gradient is as smooth as the
+                // light it came from.
+                const lod = log2(max(scale, 2)).toVar();
+                const d = scale.div(u.uSceneSize).toVar();
+                const g = vec2(
+                    lodLuma(giUV.add(vec2(d.x, 0)), lod).sub(lodLuma(giUV.sub(vec2(d.x, 0)), lod)),
+                    lodLuma(giUV.add(vec2(0, d.y)), lod).sub(lodLuma(giUV.sub(vec2(0, d.y)), lod)),
+                ).toVar();
+                const len = length(g).toVar();
+                const dir = normalize(
+                    vec3(select(len.greaterThan(1e-8), g.mul(scale.div(len)), vec2(0, 0)), u.uLightHeight),
+                );
+                const n = normalize(
+                    vec3(nTex.r.mul(2).sub(1), float(1).sub(nTex.g.mul(2)), nTex.b.mul(2).sub(1)),
+                );
+                // Wrap (half-Lambert) shading. A normalMap describes painted relief
+                // on a flat sprite, not real geometry, so it should add shape without
+                // making the surface darker on average than an un-mapped one -- and
+                // plain N.L would, since the light is nearly in the surface plane.
+                lit.assign(lit.mul(mix(float(1), dot(n, dir).mul(0.5).add(0.5), nTex.a)));
+            });
+            surface.assign(surface.add(lit.mul(u.uLightStrength)));
+        });
+        const ambientTerm = mix(u.uAmbient, surface, occ);
+
+        const color = albedo.rgb
+            .mul(irradiance.mul(u.uStrength).add(ambientTerm))
+            .add(emissive)
+            .mul(u.uExposure)
+            .toVar();
+        If(u.uToneMap.greaterThan(0.5), () => {
+            color.assign(color.div(float(1).add(color)));
+        });
+        return vec4(color, albedo.a);
+    });
 }
-
-/// Still mask-premultiplied: only ratios of it are ever used, and not dividing
-/// per tap is what keeps the gradient free of the pinch unmask can produce.
-float lodLuma(vec2 uv, float lod) {
-    return dot(tap(uv, lod).rgb, LUMA);
-}
-
-/**
- * The occluder surface light, taken straight out of the fluence buffer.
- *
- * Because the resolve pass premultiplied fluence by free space and kept that mask
- * in alpha, mip level l holds the light within a 2^l footprint already weighted by
- * how much of that footprint light could reach. So summing levels and dividing the
- * totals *once* is the mean radiance of whatever free space is in reach, with
- * blocked pixels contributing nothing rather than black.
- *
- * Every level is summed, weighted towards the finest: a rim pixel is dominated by
- * level 1 and keeps a crisp contact edge, while deep inside a wall the fine levels
- * are empty, add nothing to either total, and the coarse ones take over on their
- * own. Nothing anywhere picks *a* level, and that is the point -- a per-pixel
- * choice of mip facets the surface along every boundary where the choice flips,
- * and dividing per level pinches wherever that level's coverage is near zero.
- * Both artefacts are of the reconstruction, not of the light.
- *
- * Everything the cascades did comes along -- shadowing, colour, bounce, and the
- * correct 2D distance falloff, since that is already baked into the field being
- * averaged. scale comes back as the coverage-weighted mean footprint: how far
- * off the light that reached this pixel was found.
- */
-vec3 dilate(vec2 uv, out float scale) {
-    vec3 light = vec3(0.0);
-    float cover = 0.0;
-    float span = 0.0;
-    float w = 1.0;
-    for (float l = 1.0; l <= uLightLod; l += 1.0) {
-        vec4 s = tap(uv, l);
-        light += s.rgb * w;
-        cover += s.a * w;
-        span += s.a * w * exp2(l);
-        // Halving per level: fine detail wins wherever it exists, and the coarse
-        // levels are left as the broad fill under it. Raise it for softer, flatter
-        // occluders, lower it for crisper contact light.
-        w *= 0.5;
-    }
-    scale = span / max(cover, 1e-4);
-    return light / max(cover, 1e-4);
-}
-
-void main() {
-    // Where this fragment's world point sits in the lighting buffers.
-    vec2 giUV = (vUV * uViewSize + uGiOffset + uMargin) / uSceneSize;
-
-    // Explicit lod 0: the buffer is mipmapped for the occluder light below, and
-    // nothing here should ever be allowed to slide into a coarser level.
-    vec3 irradiance = unmask(textureLod(uFluence, giUV, 0.0));
-    vec4 albedo = texture(uAlbedo, vUV);
-    bool hi = uUpscale > 0.5;
-    vec3 emissive = (hi ? texture(uEmissiveHi, vUV).rgb : texture(uEmissive, giUV).rgb)
-        * uEmissiveScale * uEmissiveBoost;
-
-    // Occluding pixels get the dilated light instead of the cascades directly,
-    // in proportion to how much they occlude, so a half-transparent caster gets
-    // half of each.
-    float occ = hi ? texture(uOcclusionHi, vUV).a : texture(uOcclusion, giUV).a;
-    vec3 surface = uOccluderAmbient;
-    if (occ > 0.002 && uLightStrength > 0.0) {
-        float scale;
-        vec3 lit = dilate(giUV, scale);
-
-        // Clear colour is (0,0,0,0), whose alpha says "no normal here".
-        vec4 nTex = texture(uNormal, giUV);
-        if (nTex.a > 0.0) {
-            // Fluence is directionless, but the *gradient* of the dilated field
-            // points at where the light is, and scale is how far off it was
-            // found -- enough of a light vector to shade relief with. Read at the
-            // level that footprint belongs to, so the gradient is as smooth as the
-            // light it came from.
-            float lod = log2(max(scale, 2.0));
-            vec2 d = scale / uSceneSize;
-            vec2 g = vec2(
-                lodLuma(giUV + vec2(d.x, 0.0), lod) - lodLuma(giUV - vec2(d.x, 0.0), lod),
-                lodLuma(giUV + vec2(0.0, d.y), lod) - lodLuma(giUV - vec2(0.0, d.y), lod));
-            float len = length(g);
-            vec3 dir = normalize(vec3(len > 1e-8 ? g * (scale / len) : vec2(0.0), uLightHeight));
-            vec3 n = normalize(vec3(nTex.r * 2.0 - 1.0, 1.0 - nTex.g * 2.0, nTex.b * 2.0 - 1.0));
-            // Wrap (half-Lambert) shading. A normalMap describes painted relief
-            // on a flat sprite, not real geometry, so it should add shape without
-            // making the surface darker on average than an un-mapped one -- and
-            // plain N.L would, since the light is nearly in the surface plane.
-            lit *= mix(1.0, dot(n, dir) * 0.5 + 0.5, nTex.a);
-        }
-        surface += lit * uLightStrength;
-    }
-    vec3 ambient = mix(uAmbient, surface, occ);
-
-    vec3 color = albedo.rgb * (irradiance * uStrength + ambient) + emissive;
-    color *= uExposure;
-    if (uToneMap > 0.5) color = color / (1.0 + color);
-
-    finalColor = vec4(color, albedo.a);
-}
-`;

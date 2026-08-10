@@ -10,6 +10,10 @@ export default defineConfig({
         "../../packages/lib/src/index.ts",
         import.meta.url,
       ).pathname,
+      "pixi-psl": new URL(
+        "../../packages/psl/src/index.ts",
+        import.meta.url,
+      ).pathname,
     },
   },
   server: { port: 8282 },

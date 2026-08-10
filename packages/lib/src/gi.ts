@@ -1,15 +1,16 @@
-import { Color, Matrix, Mesh, Geometry, RenderTexture, Shader } from 'pixi.js';
-import type { ColorSource, Container, Renderer, WebGLRenderer } from 'pixi.js';
+import { Color, Matrix, Mesh, Geometry, RenderTexture } from 'pixi.js';
+import type { ColorSource, Container, Renderer, Shader, WebGLRenderer } from 'pixi.js';
+import { patchRenderer, setTexture } from 'pixi-psl';
 import { Pass } from './pass';
 import { SceneCollector } from './material';
-import { COMPOSITE_FRAG, EXTEND_FRAG, MERGE_FRAG, RESOLVE_FRAG, SEED_FRAG, VERTEX } from './shaders';
+import { compositeShader, extendShader, mergeShader, resolveShader, seedShader } from './shaders';
 import { buildLayout, raysWidth, snapStep } from './cascades';
 import type { HrcLayout } from './cascades';
 import type { GpuProfiler } from './profile';
 
 /** Options for {@link RadianceCascades}. Everything except `renderer`/`world` has a sane default. */
 export interface RadianceCascadesOptions {
-    /** The PixiJS renderer. WebGL only -- see the README for why. */
+    /** The PixiJS renderer. WebGL or WebGPU -- the shaders compile to both. */
     renderer: Renderer;
     /**
      * Container holding the lit scene. It must **not** be added to the stage;
@@ -108,11 +109,6 @@ export interface RadianceCascadesOptions {
     background?: ColorSource;
 }
 
-const f32 = (n: number): Float32Array => new Float32Array(n);
-
-/// Fluence -> mean incoming radiance. See RESOLVE_FRAG for why it is pi, not 2pi.
-const FLUENCE_NORM = 1 / Math.PI;
-
 /**
  * Holographic radiance cascades global illumination for PixiJS.
  *
@@ -162,8 +158,8 @@ export class RadianceCascades {
     private readonly _collector = new SceneCollector();
     private readonly _giTransform = new Matrix();
 
-    private readonly _ambient = f32(3);
-    private readonly _occluderAmbient = f32(3);
+    private readonly _ambient = new Float32Array(3);
+    private readonly _occluderAmbient = new Float32Array(3);
     private _background: number[] = [0, 0, 0, 1];
 
     private readonly _resolution: number;
@@ -223,7 +219,8 @@ export class RadianceCascades {
 
     constructor(options: RadianceCascadesOptions) {
         const { renderer, world } = options;
-        assertWebGLFloat(renderer);
+        assertFloatTargets(renderer);
+        patchRenderer(renderer);
 
         this._renderer = renderer;
         this._world = world;
@@ -242,89 +239,19 @@ export class RadianceCascades {
         this.occluderLightStrength = options.occluderLightStrength ?? 1;
         this.background = options.background ?? 0x000000;
 
-        this._seedPass = new Pass('gi-seed', SEED_FRAG, {
-            uEmissive: RenderTexture.EMPTY.source,
-            uOcclusion: RenderTexture.EMPTY.source,
-            seedUniforms: {
-                uTexSize: { value: f32(2), type: 'vec2<f32>' },
-                uExtent: { value: 1, type: 'f32' },
-                uFrustum: { value: 0, type: 'f32' },
-                uEmissiveScale: { value: 1, type: 'f32' },
-            },
-        });
-
-        this._extendPass = new Pass('gi-extend', EXTEND_FRAG, {
-            uPrev: RenderTexture.EMPTY.source,
-            extendUniforms: {
-                uPrevSize: { value: f32(2), type: 'vec2<f32>' },
-                uTexSize: { value: f32(2), type: 'vec2<f32>' },
-                uInterval: { value: 1, type: 'f32' },
-            },
-        });
-
-        this._mergePass = new Pass('gi-merge', MERGE_FRAG, {
-            uRays: RenderTexture.EMPTY.source,
-            uCones: RenderTexture.EMPTY.source,
-            mergeUniforms: {
-                uRaysSize: { value: f32(2), type: 'vec2<f32>' },
-                uConesSize: { value: f32(2), type: 'vec2<f32>' },
-                uTexSize: { value: f32(2), type: 'vec2<f32>' },
-                uInterval: { value: 1, type: 'f32' },
-            },
-        });
-
+        this._seedPass = new Pass(seedShader());
+        this._extendPass = new Pass(extendShader());
+        this._mergePass = new Pass(mergeShader());
         // Additive: the four frustums accumulate into one fluence buffer rather
         // than each getting its own for a final four-tap sum.
-        this._resolvePass = new Pass(
-            'gi-resolve',
-            RESOLVE_FRAG,
-            {
-                uCones: RenderTexture.EMPTY.source,
-                uOcclusion: RenderTexture.EMPTY.source,
-                resolveUniforms: {
-                    uExtent: { value: 1, type: 'f32' },
-                    uFrustum: { value: 0, type: 'f32' },
-                    uNorm: { value: FLUENCE_NORM, type: 'f32' },
-                },
-            },
-            'add',
-        );
+        this._resolvePass = new Pass(resolveShader(), 'add');
 
-        const compositeShader = Shader.from({
-            gl: { vertex: VERTEX, fragment: COMPOSITE_FRAG, name: 'gi-composite' },
-            resources: {
-                uAlbedo: RenderTexture.EMPTY.source,
-                uEmissive: RenderTexture.EMPTY.source,
-                uOcclusion: RenderTexture.EMPTY.source,
-                uNormal: RenderTexture.EMPTY.source,
-                uFluence: RenderTexture.EMPTY.source,
-                uEmissiveHi: RenderTexture.EMPTY.source,
-                uOcclusionHi: RenderTexture.EMPTY.source,
-                compositeUniforms: {
-                    uUpscale: { value: 0, type: 'f32' },
-                    uSceneSize: { value: f32(2), type: 'vec2<f32>' },
-                    uViewSize: { value: f32(2), type: 'vec2<f32>' },
-                    uGiOffset: { value: f32(2), type: 'vec2<f32>' },
-                    uMargin: { value: f32(2), type: 'vec2<f32>' },
-                    uStrength: { value: 1, type: 'f32' },
-                    uExposure: { value: 1, type: 'f32' },
-                    uEmissiveScale: { value: 1, type: 'f32' },
-                    uEmissiveBoost: { value: 1, type: 'f32' },
-                    uToneMap: { value: 1, type: 'f32' },
-                    uAmbient: { value: this._ambient, type: 'vec3<f32>' },
-                    uOccluderAmbient: { value: this._occluderAmbient, type: 'vec3<f32>' },
-                    uLightStrength: { value: 1, type: 'f32' },
-                    uLightLod: { value: 1, type: 'f32' },
-                    uLightHeight: { value: 1, type: 'f32' },
-                },
-            },
-        });
         this.view = new Mesh<Geometry, Shader>({
             geometry: new Geometry({
                 attributes: { aPosition: [0, 0, 1, 0, 1, 1, 0, 1] },
                 indexBuffer: [0, 1, 2, 0, 2, 3],
             }),
-            shader: compositeShader,
+            shader: compositeShader(this._ambient, this._occluderAmbient),
         });
 
         this.resize(options.width ?? renderer.screen.width, options.height ?? renderer.screen.height);
@@ -424,15 +351,15 @@ export class RadianceCascades {
         this._resolvePass.resources['resolveUniforms'].uniforms['uExtent'] = extent;
         this._resolvePass.setTexture('uOcclusion', this._occlusion.source);
 
-        const composite = this.view.shader!.resources;
-        composite['uAlbedo'] = this._albedo.source;
-        composite['uEmissive'] = this._emissive.source;
-        composite['uOcclusion'] = this._occlusion.source;
-        composite['uNormal'] = this._normal.source;
-        composite['uFluence'] = this._fluence.source;
-        composite['uEmissiveHi'] = (this._emissiveHi ?? this._emissive).source;
-        composite['uOcclusionHi'] = (this._occlusionHi ?? this._occlusion).source;
-        const pu = composite['compositeUniforms'].uniforms;
+        const composite = this.view.shader!;
+        setTexture(composite, 'uAlbedo', this._albedo.source);
+        setTexture(composite, 'uEmissive', this._emissive.source);
+        setTexture(composite, 'uOcclusion', this._occlusion.source);
+        setTexture(composite, 'uNormal', this._normal.source);
+        setTexture(composite, 'uFluence', this._fluence.source);
+        setTexture(composite, 'uEmissiveHi', (this._emissiveHi ?? this._emissive).source);
+        setTexture(composite, 'uOcclusionHi', (this._occlusionHi ?? this._occlusion).source);
+        const pu = composite.resources['compositeUniforms'].uniforms;
         pu['uUpscale'] = this._emissiveHi ? 1 : 0;
         setVec2(pu['uViewSize'], this._viewW, this._viewH);
         setVec2(pu['uSceneSize'], extent, extent);
@@ -708,14 +635,14 @@ function writeRgb(value: ColorSource, target: Float32Array): void {
     target[2] = rgb[2] ?? 0;
 }
 
-function assertWebGLFloat(renderer: Renderer): void {
+/**
+ * Every buffer in the pipeline is a half-float render target. WebGPU has those
+ * unconditionally; WebGL2 needs an extension, and without it every cascade
+ * buffer would silently clamp to 0..1 and the light would flatten.
+ */
+function assertFloatTargets(renderer: Renderer): void {
     const gl = (renderer as WebGLRenderer).gl as WebGL2RenderingContext | undefined;
-    if (!gl) {
-        throw new Error(
-            'pixi-rcgi requires the WebGL renderer. Create your app with `preference: "webgl"`.',
-        );
-    }
-    if (!gl.getExtension('EXT_color_buffer_float')) {
+    if (gl && !gl.getExtension('EXT_color_buffer_float')) {
         throw new Error(
             'pixi-rcgi requires the WebGL2 EXT_color_buffer_float extension, which this device does not expose.',
         );

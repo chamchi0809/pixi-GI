@@ -41,6 +41,22 @@ importers:
         version: 8.2.0(@types/node@26.1.2)
 
   packages/lib:
+    dependencies:
+      pixi-psl:
+        specifier: workspace:*
+        version: link:../psl
+    devDependencies:
+      pixi.js:
+        specifier: 8.19.0
+        version: 8.19.0
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+      vite:
+        specifier: 8.2.0
+        version: 8.2.0(@types/node@26.1.2)
+
+  packages/psl:
     devDependencies:
       pixi.js:
         specifier: 8.19.0

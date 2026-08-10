@@ -6,9 +6,9 @@ export default defineConfig({
     lib: {
       entry: 'src/index.ts',
       formats: ['es'],
-      fileName: 'pixi-rcgi',
+      fileName: 'pixi-psl',
     },
-    rollupOptions: { external: ['pixi.js', 'pixi-psl'] },
+    rollupOptions: { external: ['pixi.js'] },
     sourcemap: true,
   },
 });

@@ -7,6 +7,11 @@
  * behind `--enable-webgl-draft-extensions`; {@link GpuProfiler.precise} is
  * `false` when it is missing and the timings fall back to `gl.finish()`
  * bracketing, whose absolute numbers run high but whose ratios still hold.
+ *
+ * ponytail: WebGPU has no equivalent extension exposed through PixiJS, so there
+ * the profiler degrades to plain CPU wall clock -- `precise` is `false` and the
+ * numbers include whatever the driver was doing at the time. Swap in
+ * `GPUQuerySet` timestamp writes if WebGPU timings ever need to be trusted.
  */
 import type { Renderer, WebGLRenderer } from 'pixi.js';
 
@@ -33,7 +38,7 @@ export class GpuProfiler {
     /** `true` when real GPU timer queries are in use rather than the `gl.finish()` fallback. */
     readonly precise: boolean;
 
-    private readonly _gl: WebGL2RenderingContext;
+    private readonly _gl: WebGL2RenderingContext | null;
     private readonly _ext: TimerExt | null;
     private readonly _samples = new Map<string, number[]>();
     private readonly _cpu = new Map<string, number[]>();
@@ -49,9 +54,9 @@ export class GpuProfiler {
     private _rotation = 0;
 
     constructor(renderer: Renderer) {
-        const gl = (renderer as WebGLRenderer).gl as WebGL2RenderingContext;
-        this._gl = gl;
-        this._ext = gl.getExtension('EXT_disjoint_timer_query_webgl2') as TimerExt | null;
+        const gl = (renderer as WebGLRenderer).gl as WebGL2RenderingContext | undefined;
+        this._gl = gl ?? null;
+        this._ext = gl ? (gl.getExtension('EXT_disjoint_timer_query_webgl2') as TimerExt | null) : null;
         this.precise = this._ext !== null;
     }
 
@@ -81,11 +86,11 @@ export class GpuProfiler {
         if (name !== this._order[this._rotation % this._order.length]) return;
 
         if (this._ext) {
-            const query = this._pool.pop() ?? this._gl.createQuery()!;
+            const query = this._pool.pop() ?? this._gl!.createQuery()!;
             this._query = query;
-            this._gl.beginQuery(this._ext.TIME_ELAPSED_EXT, query);
+            this._gl!.beginQuery(this._ext.TIME_ELAPSED_EXT, query);
         } else {
-            this._gl.finish();
+            this._gl?.finish();
             this._cpuStart = performance.now();
         }
     }
@@ -98,11 +103,11 @@ export class GpuProfiler {
         if (name !== this._order[this._rotation % this._order.length]) return;
 
         if (this._ext) {
-            this._gl.endQuery(this._ext.TIME_ELAPSED_EXT);
+            this._gl!.endQuery(this._ext.TIME_ELAPSED_EXT);
             this._pending.push({ name, query: this._query! });
             this._query = null;
         } else {
-            this._gl.finish();
+            this._gl?.finish();
             this._push(name, performance.now() - this._cpuStart);
         }
     }
@@ -117,7 +122,7 @@ export class GpuProfiler {
         this._rotation++;
         if (!this._ext) return;
 
-        const gl = this._gl;
+        const gl = this._gl!;
         // A disjoint means the GPU was preempted and every in-flight result is
         // meaningless. Drop the batch rather than record a phantom spike.
         const disjoint = gl.getParameter(this._ext.GPU_DISJOINT_EXT) as boolean;
@@ -170,8 +175,8 @@ export class GpuProfiler {
     }
 
     destroy(): void {
-        for (const query of this._pool) this._gl.deleteQuery(query);
-        for (const { query } of this._pending) this._gl.deleteQuery(query);
+        for (const query of this._pool) this._gl?.deleteQuery(query);
+        for (const { query } of this._pending) this._gl?.deleteQuery(query);
         this._pool.length = 0;
         this._pending.length = 0;
     }

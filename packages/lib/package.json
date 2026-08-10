@@ -2,7 +2,7 @@
   "name": "pixi-rcgi",
   "version": "0.1.0",
   "description": "Holographic Radiance Cascades global illumination for PixiJS v8. Per-object and per-pixel emissive / occlusion.",
-  "keywords": ["pixijs", "pixi", "global-illumination", "radiance-cascades", "lighting", "2d", "webgl"],
+  "keywords": ["pixijs", "pixi", "global-illumination", "radiance-cascades", "lighting", "2d", "webgl", "webgpu"],
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
@@ -20,6 +20,9 @@
     "build": "vite build && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "check": "node --disable-warning=ExperimentalWarning --experimental-strip-types check.ts"
+  },
+  "dependencies": {
+    "pixi-psl": "workspace:*"
   },
   "peerDependencies": {
     "pixi.js": "^8.6.0"
