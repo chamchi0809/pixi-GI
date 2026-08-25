@@ -18,7 +18,7 @@ const MAX_JUMPS = 2;
 const COYOTE = 0.09;
 /** A jump pressed this long before landing still fires. */
 const BUFFER = 0.12;
-/** Walk cycle steps at 6fps. */
+/** Walk cycle steps at 12fps. */
 const WALK_STEP = 1 / 12;
 
 export interface PlayerTextures {

@@ -377,7 +377,7 @@ function fbm(x: number, y: number, seed: number): number {
 const FLOOR = 46;
 const TORCH_SPACING = 60;
 /** Scene density, not a library limit -- the occluder light pass is unbounded. */
-const MAX_TORCHES = 8;
+export const MAX_TORCHES = 8;
 
 /**
  * A cave in layers: wide flat-floored chambers stacked on top of each other,

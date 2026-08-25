@@ -18,7 +18,7 @@ import { Application, Container } from 'pixi.js';
 import { RadianceCascades, setMaterial } from 'pixi-rcgi';
 
 const app = new Application();
-await app.init({ preference: 'webgl' }); // WebGL only — see Limitations
+await app.init(); // WebGL2 or WebGPU, both run the same shaders
 
 // Build your scene in a container that is NOT on the stage.
 const world = new Container();
@@ -228,9 +228,14 @@ deep interiors are broad and soft by construction.
 
 Read this before shipping with it.
 
-- **WebGL2 only.** No WebGPU/WGSL path. The constructor throws on a WebGPU
-  renderer. It also requires `EXT_color_buffer_float`; the constructor throws
-  with a clear message when the device does not expose it.
+- **WebGL2 and WebGPU.** Every shader is written once in
+  [`pixi-psl`](https://www.npmjs.com/package/pixi-psl) and compiled to GLSL 300
+  es and WGSL together, so both backends run the same pipeline. The buffers are
+  half-float: WebGPU has those unconditionally, WebGL2 needs
+  `EXT_color_buffer_float` and the constructor throws with a clear message when
+  the device does not expose it. `GpuProfiler` is WebGL-only -- WebGPU
+  exposes no timer query through PixiJS, so `stats` timings come back empty
+  there.
 - **Three extra renders of your world per frame** (albedo, emission, occlusion),
   plus `4 * (2N + 1)` fullscreen passes for the hierarchy — 76 at nine cascades —
   and one mip reduction of the fluence buffer. On a scene where

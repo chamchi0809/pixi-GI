@@ -2,11 +2,31 @@
   "name": "pixi-rcgi",
   "version": "0.1.0",
   "description": "Holographic Radiance Cascades global illumination for PixiJS v8. Per-object and per-pixel emissive / occlusion.",
-  "keywords": ["pixijs", "pixi", "global-illumination", "radiance-cascades", "lighting", "2d", "webgl", "webgpu"],
+  "keywords": [
+    "pixijs",
+    "pixi",
+    "global-illumination",
+    "radiance-cascades",
+    "lighting",
+    "2d",
+    "webgl",
+    "webgpu"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chamchi0809/pixi-GI.git",
+    "directory": "packages/lib"
+  },
+  "homepage": "https://github.com/chamchi0809/pixi-GI#readme",
+  "bugs": "https://github.com/chamchi0809/pixi-GI/issues",
   "type": "module",
   "sideEffects": false,
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "main": "./dist/pixi-rcgi.js",
   "module": "./dist/pixi-rcgi.js",
   "types": "./dist/index.d.ts",

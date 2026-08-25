@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { Texture } from 'pixi.js';
-import { EMBER, EMPTY, FIRE, LAVA, MOSS, SAND, STEAM, STONE, Sim, WATER, WOOD, generate } from './src/sand/sim.ts';
+import { EMBER, EMPTY, FIRE, LAVA, MAX_TORCHES, MOSS, SAND, STEAM, STONE, Sim, WATER, WOOD, generate } from './src/sand/sim.ts';
 import { keyOf } from './src/keys.ts';
 import { TILE } from './src/level.ts';
 import { Player } from './src/player.ts';
@@ -113,7 +113,8 @@ const run = (sim: Sim, steps: number): Sim => {
     // dice roll and some caves came out pitch black.
     for (const seed of [7, 123, 99999]) {
         const cave = generate(new Sim(320, 180), seed);
-        assert.ok(cave.torches.length > 8, `seed ${seed} got wall torches (${cave.torches.length})`);
+        // The cap is the point: every seed has room for a full set, none comes out dark.
+        assert.equal(cave.torches.length, MAX_TORCHES, `seed ${seed} got wall torches (${cave.torches.length})`);
         for (const t of cave.torches) {
             assert.equal(cave.at(t.x, t.y - 6), EMPTY, 'the torch flame has room above it');
             const behind = cave.at(t.x - t.dir, t.y);
@@ -178,7 +179,7 @@ const run = (sim: Sim, steps: number): Sim => {
     assert.ok(player.onGround, 'the player lands on the floor');
     assert.equal(step(idle, 2), 0, 'the walk cycle does not advance while standing still');
     const stepped = step(walking, 2);
-    assert.ok(stepped >= 11 && stepped <= 13, `the walk cycle runs at ~6fps (${stepped} frames in 2s)`);
+    assert.ok(stepped >= 23 && stepped <= 25, `the walk cycle runs at ~12fps (${stepped} frames in 2s)`);
     assert.equal(step({ ...walking, down: true }, 2), 0, 'ducking is not walking');
 
     player.update(1 / 60, { ...idle, jump: true });

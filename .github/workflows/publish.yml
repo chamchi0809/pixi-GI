@@ -1,0 +1,29 @@
+name: Publish to npm
+
+# Both packages go out together, pixi-psl first -- pnpm publishes in dependency
+# order and rewrites the `workspace:*` range to the version it just published.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm check
+      - name: Authenticate
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+      # `demo` is private, so pnpm skips it. A version already on npm is skipped too.
+      - run: pnpm -r publish --access public --no-git-checks

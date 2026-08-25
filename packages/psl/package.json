@@ -2,11 +2,31 @@
   "name": "pixi-psl",
   "version": "0.1.0",
   "description": "PSL -- a node-based shader language for PixiJS. Write once in TypeScript, run on WebGL (GLSL 300 es) and WebGPU (WGSL).",
-  "keywords": ["pixijs", "pixi", "shader", "glsl", "wgsl", "webgpu", "webgl", "tsl"],
+  "keywords": [
+    "pixijs",
+    "pixi",
+    "shader",
+    "glsl",
+    "wgsl",
+    "webgpu",
+    "webgl",
+    "tsl"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chamchi0809/pixi-GI.git",
+    "directory": "packages/psl"
+  },
+  "homepage": "https://github.com/chamchi0809/pixi-GI/tree/main/packages/psl#readme",
+  "bugs": "https://github.com/chamchi0809/pixi-GI/issues",
   "type": "module",
   "sideEffects": false,
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "main": "./dist/pixi-psl.js",
   "module": "./dist/pixi-psl.js",
   "types": "./dist/index.d.ts",
