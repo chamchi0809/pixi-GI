@@ -297,7 +297,11 @@ export class RadianceCascades {
         this._layout = buildLayout(this._viewW, this._viewH, this._marginFraction, this._cascadeOverride);
         const { extent, cascades, marginX, marginY } = this._layout;
 
-        this._disposeTargets();
+        // Destroying a bound source emits 'change' with `destroyed`, which makes
+        // every BindGroup holding it null its own resources -- and the rebind
+        // below would then write into that null. So keep the old targets alive
+        // until the new ones are bound, and free them at the end.
+        const stale = this._targets();
 
         this._albedo = RenderTexture.create({
             width: this._width,
@@ -322,6 +326,9 @@ export class RadianceCascades {
             const hi = { width: this._width, height: this._height, resolution: this._renderer.resolution };
             this._emissiveHi = RenderTexture.create({ ...hi, format: 'rgba16float', antialias: false, scaleMode: 'linear' });
             this._occlusionHi = RenderTexture.create({ ...hi, format: 'rgba8unorm', antialias: false, scaleMode: 'linear' });
+        } else {
+            this._emissiveHi = null;
+            this._occlusionHi = null;
         }
         // Cascade n's rays: `2^n + 1` per plane, so a little wider than the
         // buffer. All of them are live at once -- extension fills them bottom-up
@@ -366,6 +373,16 @@ export class RadianceCascades {
         setVec2(pu['uMargin'], marginX, marginY);
 
         this.view.scale.set(this._width, this._height);
+
+        // The per-frame slots still point at last frame's buffers, and a bind
+        // group holding one when it is destroyed nulls itself -- so repoint them
+        // as well before the stale targets go.
+        this._extendPass.setTexture('uPrev', this._rays[0]!.source);
+        this._mergePass.setTexture('uRays', this._rays[0]!.source);
+        this._mergePass.setTexture('uCones', this._coneA.source);
+        this._resolvePass.setTexture('uCones', this._coneA.source);
+
+        for (const rt of stale) rt?.destroy(true);
     }
 
     /**
@@ -602,8 +619,8 @@ export class RadianceCascades {
         this._disposeTargets();
     }
 
-    private _disposeTargets(): void {
-        for (const rt of [
+    private _targets(): (RenderTexture | null | undefined)[] {
+        return [
             this._albedo,
             this._emissive,
             this._occlusion,
@@ -614,9 +631,11 @@ export class RadianceCascades {
             this._coneA,
             this._coneB,
             this._fluence,
-        ]) {
-            rt?.destroy(true);
-        }
+        ];
+    }
+
+    private _disposeTargets(): void {
+        for (const rt of this._targets()) rt?.destroy(true);
         this._rays = [];
         this._emissiveHi = null;
         this._occlusionHi = null;
