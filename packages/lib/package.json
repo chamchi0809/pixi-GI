@@ -1,6 +1,6 @@
 {
   "name": "pixi-rcgi",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Holographic Radiance Cascades global illumination for PixiJS v8. Per-object and per-pixel emissive / occlusion.",
   "keywords": [
     "pixijs",
