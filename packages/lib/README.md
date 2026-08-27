@@ -91,6 +91,7 @@ Required: `renderer`, `world`. Everything else has a default.
 | --- | --- | --- |
 | `resolution` | `0.5` | Fraction of the *logical* size the lighting runs at. The only cost knob. See below. |
 | `cascades` | auto | As many as the buffer holds. Lowering it caps how far light travels, at `2^cascades` lighting pixels. |
+| `smoothing` | `1` | How many plane-lattice harmonics to null out of the light, `0` to `3`. See below. |
 | `margin` | `0.5` | Off-view world that still emits and occludes, as a fraction of the view per side. Free, but capped. See below. |
 | `ambient` | `0x000000` | Flat light added everywhere. |
 | `occluderAmbient` | `0x000000` | Flat light for pixels that occlude. See below. |
@@ -103,7 +104,7 @@ Required: `renderer`, `world`. Everything else has a default.
 | `width` / `height` | screen | Logical size. |
 
 Runtime: `view`, `render()`, `resize(w, h)`, `destroy()`, `stats`, the mutable
-fields `strength`, `exposure`, `emissiveBoost`, `toneMap`,
+fields `strength`, `exposure`, `emissiveBoost`, `toneMap`, `smoothing`,
 `occluderLightRange` / `occluderLightHeight` / `occluderLightStrength`, plus
 `ambient` / `occluderAmbient` / `background` setters.
 
@@ -137,6 +138,41 @@ What stays soft is angular: cascade 0 resolves two rays per probe, and the
 extension chain averages crossed pairs on the way up, which is deliberate — that
 diffusion is what stops a moving light crawling.
 
+#### The plane lattice: `smoothing`
+
+HRC probes are *planes*: cascade `n` has one every `2^n` lighting pixels. The
+merge treats a plane differently depending on where it falls in the cascade above
+— an odd plane lands exactly on one of the parent's, and an even one has to reach
+twice as far and average two — so the answer is a touch sharper on odd planes and
+softer on even ones. That alternation is a fixed grid, one per cascade, on both
+axes because there are four frustums, and stacked up they read as an
+ordered-dither weave, most visible in a wide dim gradient.
+
+It is structural, not noise. But it is *periodic*, at 2, 4 and 8 lighting pixels,
+which makes it something a filter can delete outright rather than blur away: four
+bilinear taps on the diagonals at a quarter of the period have a transfer of
+`cos(2πf · period/4)`, which is exactly zero at that frequency and at the
+checkerboard, and near enough `1` for everything below it. `smoothing` runs one
+such pass per harmonic on the fluence buffer, before the mips are built.
+
+| | nulls | |
+| --- | --- | --- |
+| `0` | — | The raw field. |
+| `1` | 2px | The default. The 2-pixel weave is the one you can see. |
+| `2` | + 4px | |
+| `3` | + 8px | Reaches four lighting pixels either side; by here it is the light being filtered as much as the lattice. |
+
+Four taps each, so the cost is nothing next to the hierarchy that produced the
+field — it shows up as the `smooth` stage in `stats`. What it spends is
+sharpness, which is why it stops at `3`. Measured by DFT on the demo at
+`resolution: 0.5`, the checkerboard component falls from 1.5% of mean luma to
+0.05% — the noise floor of the measurement — between `0` and `1`.
+
+The filter is mask-aware: the fluence buffer is premultiplied by free space (see
+below), so each pass averages the *masked* field and re-premultiplies by the
+fragment's own unfiltered mask. Filtering the two apart would drag light a texel
+into every occluder, and the composite would then shade it twice.
+
 ### Lighting occluders
 
 Radiance cascades simulate light travelling *in the plane*. A pixel that
@@ -164,6 +200,13 @@ keeps a crisp contact edge; deep inside a wall the fine levels are empty, add
 nothing to either total, and the coarse ones take over on their own. It is blended
 in by how much the pixel occludes, so a half-transparent caster gets half this and
 half the cascades.
+
+The other half of that blend matters as much: the cascades' own term is faded
+*out* by the same occlusion. A caster sits in its own shadow, so the fluence under
+it is masked, and undoing the premultiply there is a `0/0` — one value per
+lighting texel, which at low `resolution` paints the caster in hard texel-sized
+rectangles. It is a reconstruction of a field that has nothing to say about the
+inside of an occluder; the dilation is the term that does.
 
 The buffers are snapped onto a lattice as coarse as the coarsest mip read (capped
 by the margin, which absorbs the offset), so a world point keeps a fixed phase
@@ -261,6 +304,11 @@ Read this before shipping with it.
   bandwidth-bound. Extensions start at cascade 0 rather than cascade 3 as the
   paper has it — more angular diffusion, and a light you carry around stops
   crawling.
+- **The merge leaves a lattice in the light.** Probes are planes and the merge
+  branches on a plane's parity, so each cascade biases a fixed grid of them — a
+  faint ordered-dither weave at 2, 4 and 8 lighting pixels. `smoothing` nulls
+  those frequencies out of the fluence buffer (see above) rather than fixing the
+  merge; interpolating the probe position instead breaks the volumetrics outright.
 - **Light bends at grazing angles.** Rays are chained rather than traced, so a
   chain can slip past a thin occluder that a straight ray would have hit, and
   light leaks a little around the ends of thin walls. Cascade 0 is exact; the

@@ -367,6 +367,65 @@ export function resolveShader(): Shader {
     });
 }
 
+/**
+ * Null one harmonic of the plane lattice in the resolved fluence.
+ *
+ * Probes are planes, and {@link mergeShader} treats a plane by its parity: an
+ * odd one lands exactly on a plane of the cascade above and merges against it,
+ * an even one falls half an interval short, so its rays reach twice as far and
+ * the answer is averaged with the cascade above's own. The two are not equally
+ * sharp, so alternating planes carry alternating bias -- and every cascade adds
+ * its own, planes every `2^n` pixels, one period per level. Four frustums put
+ * all of it on both axes. Nested grids of alternating bias is what an ordered
+ * dither matrix is, which is why it reads as a Bayer weave rather than as noise.
+ *
+ * Being periodic and locked to the buffer grid, it can be nulled rather than
+ * blurred away: two taps a quarter of a period either side of a texel have a
+ * transfer of `cos(2*pi*f*period/4)`, which is *zero* at `f = 1/period`. Four
+ * bilinear taps on the diagonals is that filter on both axes at once, and takes
+ * the checkerboard between them with it. One pass per period -- 2 texels, then
+ * 4, then 8 -- each nulling one more cascade's grid for another four taps.
+ *
+ * What it costs is the width: the 2-texel pass is a 3x3 tent and each one after
+ * doubles the reach. Light is low frequency and wears that easily; contact
+ * shadows are not, which is why the count is a knob and not a constant.
+ *
+ * Fluence is premultiplied by free space with the mask in alpha (see
+ * {@link resolveShader}), so the taps are averaged as that masked field and then
+ * re-premultiplied by this fragment's *own* mask: the average is of the light in
+ * whatever free space the taps reached, never darkened towards an occluder, and
+ * the mask itself stays exactly as sharp as the occluders that made it. Letting
+ * the filtered mask through instead would bleed light a texel into every
+ * occluder, and the composite would shade those pixels twice -- once as
+ * irradiance, once as the dilated surface light.
+ */
+export function smoothShader(): Shader {
+    const p = new PslProgram('gi-smooth');
+    const fluence = p.texture('uFluence');
+    const u = p.uniforms('smoothUniforms', {
+        /// Diagonal tap offset in UV: a quarter of the period this pass nulls.
+        uTap: { type: 'vec2', value: f32(2) },
+    });
+
+    return p.build({
+        vertex: fullscreen,
+        fragment: () => {
+            const d = u.uTap;
+            const flip = vec2(d.x, d.y.negate());
+            // Unnormalised: only the ratio of the sums is used, and the count
+            // cancels out of it.
+            const sum = fluence
+                .sample(uv.add(d))
+                .add(fluence.sample(uv.sub(d)))
+                .add(fluence.sample(uv.add(flip)))
+                .add(fluence.sample(uv.sub(flip)))
+                .toVar();
+            const mask = fluence.sample(uv).a.toVar();
+            return vec4(sum.rgb.mul(mask.div(max(sum.a, 1e-4))), mask);
+        },
+    });
+}
+
 /** Rec. 709 luma, for the gradient the occluder shading follows. */
 const LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -557,8 +616,16 @@ export function compositeShader(ambient: Float32Array, occluderAmbient: Float32A
         });
         const ambientTerm = mix(u.uAmbient, surface, occ);
 
+        // The cascades' own answer, faded out by the same occlusion that faded the
+        // surface light in. A caster sits in its own shadow, so the fluence under it
+        // is masked and `unmask` reads a 0/0 there -- one value per lighting texel,
+        // which paints the caster in hard texel-sized rectangles at low resolutions.
+        // That is the reconstruction of a field that has nothing to say about the
+        // inside of an occluder; `surface` is the term that does.
+        const direct = irradiance.mul(u.uStrength).mul(float(1).sub(occ));
+
         const color = albedo.rgb
-            .mul(irradiance.mul(u.uStrength).add(ambientTerm))
+            .mul(direct.add(ambientTerm))
             .add(emissive)
             .mul(u.uExposure)
             .toVar();

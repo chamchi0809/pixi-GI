@@ -44,6 +44,7 @@ async function main(): Promise<void> {
     resolution: 0.25,
     /** 0 = as many cascades as the buffer holds. */
     cascades: 0,
+    smoothing: 1,
     exposure: 0.95,
     zoom: 1,
   };
@@ -54,6 +55,7 @@ async function main(): Promise<void> {
       world,
       resolution: params.resolution,
       ...(params.cascades > 0 ? { cascades: params.cascades } : {}),
+      smoothing: params.smoothing,
       strength: params.gi ? 1 : 0,
       exposure: params.exposure,
     });
@@ -150,6 +152,13 @@ async function main(): Promise<void> {
     .addBinding(params, "cascades", { min: 0, max: 11, step: 1, label: "cascades (0=auto)" })
     .on("change", (e) => {
       if (e.last) rebuild();
+    });
+  // A runtime setter, unlike the two above it: the passes it adds read and write
+  // buffers that already exist.
+  pane
+    .addBinding(params, "smoothing", { min: 0, max: 3, step: 1 })
+    .on("change", (e) => {
+      gi.smoothing = e.value;
     });
   pane.addBinding(params, "exposure", { min: 0.1, max: 4, step: 0.01 }).on("change", (e) => {
     gi.exposure = e.value;

@@ -3,7 +3,7 @@ import type { ColorSource, Container, Renderer, Shader, WebGLRenderer } from 'pi
 import { patchRenderer, setTexture } from 'pixi-psl';
 import { Pass } from './pass';
 import { SceneCollector } from './material';
-import { compositeShader, extendShader, mergeShader, resolveShader, seedShader } from './shaders';
+import { compositeShader, extendShader, mergeShader, resolveShader, seedShader, smoothShader } from './shaders';
 import { buildLayout, raysWidth, snapStep } from './cascades';
 import type { HrcLayout } from './cascades';
 import type { GpuProfiler } from './profile';
@@ -44,6 +44,26 @@ export interface RadianceCascadesOptions {
      * `2^cascades` lighting pixels, and drops two passes per cascade per frustum.
      */
     cascades?: number;
+    /**
+     * How many harmonics of the HRC plane lattice to filter out of the light,
+     * `0` to `3`.
+     *
+     * Probes are planes and the merge treats a plane by its parity, so
+     * alternating planes carry alternating bias -- one nested grid per cascade,
+     * on both axes, which is what makes the pattern read as a Bayer weave rather
+     * than as noise. It is periodic and locked to the buffer grid, so each pass
+     * *nulls* one period outright instead of blurring it away: `1` takes the
+     * 2-pixel checkerboard, `2` the 4-pixel grid with it, `3` the 8-pixel one.
+     * Whatever survives that is broad enough to read as light rather than as
+     * pattern.
+     *
+     * A pass is four taps over one buffer, so next to the hierarchy it is free;
+     * what it spends is sharpness. The first is a 3x3 tent in lighting pixels
+     * and each one after doubles the reach, so `2` and `3` start to soften
+     * contact shadows -- reach for `resolution` before reaching for them.
+     * @default 1
+     */
+    smoothing?: number;
     /**
      * World kept outside the view that still emits and occludes, as a **fraction
      * of the view** on each side. Rays travel through it, so a torch a little
@@ -130,6 +150,8 @@ export class RadianceCascades {
     emissiveBoost: number;
     /** Reinhard tone mapping. */
     toneMap: boolean;
+    /** How many plane-lattice harmonics to filter out of the light, `0` to `3`. */
+    smoothing: number;
 
     /** How far into an occluder light reaches, in world pixels. */
     occluderLightRange: number;
@@ -209,11 +231,18 @@ export class RadianceCascades {
      * dilates into the occluders -- see COMPOSITE_FRAG.
      */
     private _fluence!: RenderTexture;
+    /**
+     * The other end of the smoothing chain's ping-pong -- same size and format
+     * as `_fluence`, without the mip chain. Made the first time `smoothing` is
+     * nonzero, so a pipeline that never smooths never pays for it.
+     */
+    private _fluenceScratch: RenderTexture | null = null;
 
     private readonly _seedPass: Pass;
     private readonly _extendPass: Pass;
     private readonly _mergePass: Pass;
     private readonly _resolvePass: Pass;
+    private readonly _smoothPass: Pass;
 
     private _destroyed = false;
 
@@ -232,6 +261,7 @@ export class RadianceCascades {
         this.exposure = options.exposure ?? 1;
         this.emissiveBoost = options.emissiveBoost ?? 1;
         this.toneMap = options.toneMap ?? true;
+        this.smoothing = options.smoothing ?? 1;
         this.ambient = options.ambient ?? 0x000000;
         this.occluderAmbient = options.occluderAmbient ?? 0x000000;
         this.occluderLightRange = options.occluderLightRange ?? 256;
@@ -245,6 +275,7 @@ export class RadianceCascades {
         // Additive: the four frustums accumulate into one fluence buffer rather
         // than each getting its own for a final four-tap sum.
         this._resolvePass = new Pass(resolveShader(), 'add');
+        this._smoothPass = new Pass(smoothShader());
 
         this.view = new Mesh<Geometry, Shader>({
             geometry: new Geometry({
@@ -381,6 +412,10 @@ export class RadianceCascades {
         this._mergePass.setTexture('uRays', this._rays[0]!.source);
         this._mergePass.setTexture('uCones', this._coneA.source);
         this._resolvePass.setTexture('uCones', this._coneA.source);
+        // The scratch buffer is sized off `extent` too, so it goes with the rest
+        // and is remade at the new size the next time smoothing asks for it.
+        this._fluenceScratch = null;
+        this._smoothPass.setTexture('uFluence', this._fluence.source);
 
         for (const rt of stale) rt?.destroy(true);
     }
@@ -489,8 +524,20 @@ export class RadianceCascades {
         // One stage for the whole hierarchy, not one per pass: it runs 4*(2N+1)
         // times a frame, and `begin` records a sample each time, so per-pass
         // timings would be dominated by the query overhead they are measuring.
+        // The lattice filter ping-pongs between the two fluence buffers and has
+        // to finish in `_fluence` -- the one the composite reads, and the only
+        // one carrying mips -- so an odd number of passes resolves into the
+        // scratch buffer and an even number straight into `_fluence`.
+        const smoothing = this._smoothing();
+        const resolveTarget = smoothing % 2 === 1 ? this._fluenceScratch! : this._fluence;
         profiler?.begin('hrc');
-        for (let i = this.repeat['hrc'] ?? 1; i > 0; i--) this._renderCascades();
+        for (let i = this.repeat['hrc'] ?? 1; i > 0; i--) this._renderCascades(resolveTarget);
+        // No `repeat` key: every pass here reads what the one before it wrote, so
+        // running the chain twice would filter twice rather than repeat the work.
+        if (smoothing > 0) {
+            profiler?.begin('smooth');
+            this._smooth(smoothing);
+        }
         // The occluder surface light is a mip tap of the fluence, so the chain has
         // to be rebuilt after the resolve. One 512^2 RGBA16F reduction.
         this._fluence.source.updateMipmaps();
@@ -525,9 +572,10 @@ export class RadianceCascades {
      * Per frustum: seed cascade 0's one-pixel rays off the scene (the only pass
      * that reads it at all), extend them pairwise up to cascade `N-1`, then merge
      * back down into cones, and add that frustum's quarter of the sky into the
-     * shared fluence buffer.
+     * shared fluence buffer -- `target`, since the smoothing chain decides which
+     * of the two that is.
      */
-    private _renderCascades(): void {
+    private _renderCascades(target: RenderTexture): void {
         const renderer = this._renderer;
         const { extent, cascades } = this._layout;
 
@@ -587,7 +635,43 @@ export class RadianceCascades {
             this._resolvePass.setTexture('uCones', read.source);
             ru['uFrustum'] = frustum;
             // Additive, so only the first frustum clears.
-            this._resolvePass.run(renderer, this._fluence, frustum === 0);
+            this._resolvePass.run(renderer, target, frustum === 0);
+        }
+    }
+
+    /**
+     * Smoothing passes to run this frame, clamped, and the scratch buffer they
+     * need. It is made here rather than in {@link resize} because `smoothing` is
+     * a live field: turning it on costs one more `extent^2` RGBA16F buffer, and
+     * leaving it at `0` costs nothing at all.
+     */
+    private _smoothing(): number {
+        const passes = Math.max(0, Math.min(MAX_SMOOTHING, Math.round(this.smoothing)));
+        if (passes > 0 && !this._fluenceScratch) {
+            const { extent } = this._layout;
+            this._fluenceScratch = createTarget(extent, extent, 'rgba16float', 'linear');
+        }
+        return passes;
+    }
+
+    /**
+     * The lattice filter -- one pass per period, two lighting pixels then four
+     * then eight, ping-ponged between the two fluence buffers. See
+     * {@link smoothShader} for what is being nulled and why it can be.
+     */
+    private _smooth(passes: number): void {
+        const { extent } = this._layout;
+        const u = this._smoothPass.resources['smoothUniforms'].uniforms;
+        const odd = passes % 2 === 1;
+        let read = odd ? this._fluenceScratch! : this._fluence;
+        let write = odd ? this._fluence : this._fluenceScratch!;
+        for (let i = 0; i < passes; i++) {
+            // A quarter of the period this pass nulls: half a texel, then one, then two.
+            const tap = 2 ** (i - 1) / extent;
+            setVec2(u['uTap'], tap, tap);
+            this._smoothPass.setTexture('uFluence', read.source);
+            this._smoothPass.run(this._renderer, write);
+            [read, write] = [write, read];
         }
     }
 
@@ -615,6 +699,7 @@ export class RadianceCascades {
         this._extendPass.destroy();
         this._mergePass.destroy();
         this._resolvePass.destroy();
+        this._smoothPass.destroy();
         this.view.destroy({ children: true });
         this._disposeTargets();
     }
@@ -631,6 +716,7 @@ export class RadianceCascades {
             this._coneA,
             this._coneB,
             this._fluence,
+            this._fluenceScratch,
         ];
     }
 
@@ -639,8 +725,16 @@ export class RadianceCascades {
         this._rays = [];
         this._emissiveHi = null;
         this._occlusionHi = null;
+        this._fluenceScratch = null;
     }
 }
+
+/**
+ * Lattice harmonics {@link RadianceCascadesOptions.smoothing} will null: the
+ * 2-, 4- and 8-pixel grids. A fourth pass reaches eight lighting pixels either
+ * side, by which point it is the light being filtered and not the lattice.
+ */
+const MAX_SMOOTHING = 3;
 
 function createTarget(
     width: number,

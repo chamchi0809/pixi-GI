@@ -102,6 +102,12 @@ sharpness and the price together, and `1` is pixel-crisp. It is fixed at
 construction, and each step up costs 4× the pixels, 4× the memory and one more
 cascade. [Measurements](packages/lib/README.md#cost-and-sharpness-resolution).
 
+The merge leaves a faint grid in the light — probes are planes, and the merge
+branches on their parity. `smoothing` (default `1`) filters it out at a few taps
+a frame: the pattern is periodic, so the pass is tuned to be exactly zero at its
+frequency rather than to blur it.
+[How](packages/lib/README.md#the-plane-lattice-smoothing).
+
 The [reference](packages/lib/README.md#limitations) has the full list and the
 reasoning behind each one.
 
