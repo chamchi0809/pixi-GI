@@ -2,7 +2,8 @@
 
 Holographic-radiance-cascades global illumination for [PixiJS](https://pixijs.com) v8.
 
-![sand demo](docs/sand.png)
+<img width="745" height="376" alt="image" src="https://github.com/user-attachments/assets/db2e9cce-a6f5-49bc-ba0c-9f6a7601c9f6" />
+
 
 Tag what emits light and what blocks it. <br/>
 Everything else is lit background, but it neither emits nor blocks.
