@@ -464,6 +464,8 @@ export class RadianceCascades {
         this._fluenceScratch = null;
         this._fluencePrev = null;
         this._smoothPass.setTexture('uFluence', this._fluence.source);
+        this._temporalPass.setTexture('uCurrent', this._fluence.source);
+        this._temporalPass.setTexture('uHistory', this._fluence.source);
 
         for (const rt of stale) rt?.destroy(true);
     }
