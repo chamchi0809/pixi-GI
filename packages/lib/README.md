@@ -92,6 +92,7 @@ Required: `renderer`, `world`. Everything else has a default.
 | `resolution` | `0.5` | Fraction of the *logical* size the lighting runs at. The only cost knob. See below. |
 | `cascades` | auto | As many as the buffer holds. Lowering it caps how far light travels, at `2^cascades` lighting pixels. |
 | `smoothing` | `1` | How many plane-lattice harmonics to null out of the light, `0` to `3`. See below. |
+| `temporal` | `0` | How much of last frame's light to keep, `0` to `0.98`. Costs one buffer and one pass, and only while it is above zero. See below. |
 | `margin` | `0.5` | Off-view world that still emits and occludes, as a fraction of the view per side. Free, but capped. See below. |
 | `ambient` | `0x000000` | Flat light added everywhere. |
 | `occluderAmbient` | `0x000000` | Flat light for pixels that occlude. See below. |
@@ -105,6 +106,7 @@ Required: `renderer`, `world`. Everything else has a default.
 
 Runtime: `view`, `render()`, `resize(w, h)`, `destroy()`, `stats`, the mutable
 fields `strength`, `exposure`, `emissiveBoost`, `toneMap`, `smoothing`,
+`temporal`,
 `occluderLightRange` / `occluderLightHeight` / `occluderLightStrength`, plus
 `ambient` / `occluderAmbient` / `background` setters.
 
@@ -172,6 +174,51 @@ The filter is mask-aware: the fluence buffer is premultiplied by free space (see
 below), so each pass averages the *masked* field and re-premultiplies by the
 fragment's own unfiltered mask. Filtering the two apart would drag light a texel
 into every occluder, and the composite would then shade it twice.
+
+#### Frame to frame: `temporal`
+
+`smoothing` deletes the lattice *within* a frame. What is left over is the field
+moving between frames: the scene changes a little, every probe re-answers from
+scratch, and the answer lands a little differently. It reads as a low shimmer in
+large dim areas — the same places the lattice shows up — and it is the thing that
+tires eyes out in a game you stare at for an hour.
+
+`temporal` blends the new field with the previous one, `0` = ignore history,
+`0.9` = keep 90% of it. Try `0.85`. It runs on the fluence buffer, before the
+mips, so what it stabilises is the *light*, not the picture: sprites, particles
+and the camera stay as crisp as they were, and nothing ghosts behind a moving
+object the way accumulating the composite would.
+
+Two things make that safe. The buffer is snapped to its own lattice, so the
+camera moves in whole texels and the previous frame can be reprojected onto the
+current one *exactly* — an affine transform, no resampling error, no drift while
+you pan. And history is rejected per pixel where the two frames disagree on
+luma by more than a relative amount: a light that switches on, a wall that
+moves, or a pixel whose history is off the buffer takes the new value on the
+frame it changes, while the small disagreements that are just re-answering noise
+accumulate. There is no history-valid flag to reset and nothing to warm up.
+
+Measured on the demo's sand scene at `resolution: 0.25`, 240 hand-stepped
+frames, mean per-pixel luma change between consecutive frames (`d1`) and its
+second difference (`d2`, which is the flicker proper):
+
+| `temporal` | `d1` | `d2` | mean luma |
+| --- | --- | --- | --- |
+| `0` | 8.3e-4 | 15.6e-4 | 0.05188 |
+| `0.5` | 6.8e-4 (-18%) | 11.4e-4 (-27%) | 0.05189 |
+| `0.85` | 4.9e-4 (-41%) | 8.7e-4 (-44%) | 0.05190 |
+| `0.95` | 3.8e-4 (-54%) | 7.0e-4 (-55%) | 0.05186 |
+
+Mean luma is flat to 0.1%, so it is not trading brightness for stability. The
+cost is one extra `extent²` RGBA16F buffer and one fullscreen pass — the
+`temporal` stage in `stats`, 0.15ms at 512² on an M1 Pro, next to 3.2ms for the
+hierarchy that produced the field. Neither is allocated while `temporal` is `0`,
+so leaving it off costs nothing.
+
+What it spends is response time: a light that fades in over a few frames arrives
+that much later, because a slow fade is exactly what the rejection is built to
+smooth. Above ~`0.95` that lag starts to be visible, which is why it stops at
+`0.98`.
 
 ### Lighting occluders
 

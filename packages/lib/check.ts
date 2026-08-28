@@ -106,9 +106,11 @@ console.log('buffer layout ok');
     s.extendShader();
     s.mergeShader();
     s.resolveShader();
+    s.smoothShader();
+    s.temporalShader();
     s.compositeShader(new Float32Array(3), new Float32Array(3));
     (Shader as unknown as { from: unknown }).from = from;
-    assert.equal(captured.length, 5);
+    assert.equal(captured.length, 7);
 
     // The composite is the only one Pixi draws for us; the four before it are the
     // internal passes, drawn straight through the encoder.

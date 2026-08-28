@@ -5,6 +5,7 @@
  * -- this is how you read it when you are counting fetches or ALU. Loaded
  * through Vite because the sources use TypeScript that node cannot strip.
  */
+import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 
 // PixiJS probes a throwaway GL context for its float precision when a GlProgram
@@ -12,14 +13,14 @@ import { createServer } from 'vite';
 // text -- so give it a canvas that has no context to offer.
 globalThis.document ??= { createElement: () => ({ getContext: () => null }) };
 
-const root = new URL('../packages/lib/', import.meta.url).pathname.replace(/^\//, '');
+const root = fileURLToPath(new URL('../packages/lib/', import.meta.url));
 const server = await createServer({
     root,
     server: { middlewareMode: true },
     logLevel: 'error',
     // Straight at the source, as the demo does -- neither workspace package is built here.
     resolve: {
-        alias: { 'pixi-psl': new URL('../packages/psl/src/index.ts', import.meta.url).pathname.replace(/^\//, '') },
+        alias: { 'pixi-psl': fileURLToPath(new URL('../packages/psl/src/index.ts', import.meta.url)) },
     },
 });
 const shaders = await server.ssrLoadModule('/src/shaders.ts');
@@ -30,6 +31,8 @@ const build = {
     extend: shaders.extendShader,
     merge: shaders.mergeShader,
     resolve: shaders.resolveShader,
+    smooth: shaders.smoothShader,
+    temporal: shaders.temporalShader,
     composite: () => shaders.compositeShader(new Float32Array(3), new Float32Array(3)),
 };
 

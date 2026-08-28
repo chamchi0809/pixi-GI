@@ -45,6 +45,7 @@ async function main(): Promise<void> {
     /** 0 = as many cascades as the buffer holds. */
     cascades: 0,
     smoothing: 1,
+    temporal: 0,
     exposure: 0.95,
     zoom: 1,
   };
@@ -56,6 +57,7 @@ async function main(): Promise<void> {
       resolution: params.resolution,
       ...(params.cascades > 0 ? { cascades: params.cascades } : {}),
       smoothing: params.smoothing,
+      temporal: params.temporal,
       strength: params.gi ? 1 : 0,
       exposure: params.exposure,
     });
@@ -159,6 +161,13 @@ async function main(): Promise<void> {
     .addBinding(params, "smoothing", { min: 0, max: 3, step: 1 })
     .on("change", (e) => {
       gi.smoothing = e.value;
+    });
+  // Also live: the first nonzero value allocates the history buffer, and from
+  // there it is one number in a blend.
+  pane
+    .addBinding(params, "temporal", { min: 0, max: 0.98, step: 0.01 })
+    .on("change", (e) => {
+      gi.temporal = e.value;
     });
   pane.addBinding(params, "exposure", { min: 0.1, max: 4, step: 0.01 }).on("change", (e) => {
     gi.exposure = e.value;

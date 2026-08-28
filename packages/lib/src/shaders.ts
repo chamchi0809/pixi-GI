@@ -28,6 +28,7 @@ import type { PslNode, PslTexture } from 'pixi-psl';
 import {
     If,
     Loop,
+    abs,
     atan,
     ceil,
     dot,
@@ -41,6 +42,7 @@ import {
     mod,
     normalize,
     select,
+    smoothstep,
     step,
     vec2,
     vec3,
@@ -426,8 +428,100 @@ export function smoothShader(): Shader {
     });
 }
 
-/** Rec. 709 luma, for the gradient the occluder shading follows. */
+/** Rec. 709 luma, for the gradient the occluder shading follows and the temporal reprojection's agreement test. */
 const LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+/**
+ * Relative luma disagreement between the reprojected history and this frame's
+ * light at which the history starts to be dropped, and at which it is gone.
+ *
+ * The pair is what separates *flicker* from *change*. Everything HRC pumps
+ * frame to frame -- the ray fan landing differently as the camera creeps, an
+ * emitter crossing a lighting texel -- moves a pixel by a few percent, which is
+ * under the first threshold and gets averaged away. A light switching on, a
+ * shadow sweeping past, a rocket arriving: tens of percent at least, and the
+ * history is dropped rather than smeared across the frames after it.
+ *
+ * Relative, so it is scale free: one pair of numbers works for an HDR emitter
+ * and for the dim wall behind it, with no exposure to tune it against. The
+ * bottom of that range is where a *relative* difference is largest and matters
+ * least -- near black, where the absolute difference is invisible after tone
+ * mapping -- so dropping the history there costs nothing.
+ */
+const REJECT_FROM = 0.1;
+const REJECT_TO = 0.4;
+
+/**
+ * Blend this frame's resolved fluence with the last frame's, reprojected
+ * through the camera.
+ *
+ * Every artefact HRC has left is *temporal*: the field is resolved from a fan
+ * of rays that lands on different texels each time the camera moves a
+ * sub-pixel, so a wall lit through a doorway shimmers even though nothing in
+ * the scene moved. It is small per frame and impossible to unsee at 60Hz, and
+ * it is not something another spatial filter can reach -- {@link smoothShader}
+ * already nulls everything periodic, and what is left is the light itself
+ * moving slightly.
+ *
+ * So average it over time instead. `uKeep` is a plain exponential moving
+ * average, which turns per-frame jitter into a value that settles: at `0.9`,
+ * the noise that survives is roughly a quarter of what one frame carries, for
+ * one buffer and one pass.
+ *
+ * What that costs is lag, and the two uniforms above are what keep the lag off
+ * anything the eye would follow. Everything else is handled by the
+ * reprojection: the history is a *world*-space field read through last frame's
+ * camera, so panning and zooming do not smear it -- see `uReproj*`, and the
+ * `onBuffer` test for the sliver of it that came from outside the buffer and
+ * has no history at all.
+ *
+ * Both fields are premultiplied by free space with the mask in alpha (see
+ * {@link resolveShader}), and the blend is linear, so the mask averages with
+ * the light it weights and the pair stays consistent -- no unmasking, and
+ * nothing for the composite's divide to trip over.
+ */
+export function temporalShader(): Shader {
+    const p = new PslProgram('gi-temporal');
+    const current = p.texture('uCurrent');
+    const history = p.texture('uHistory');
+    const u = p.uniforms('temporalUniforms', {
+        /// Fraction of the reprojected history kept where it agrees with this frame.
+        uKeep: { type: 'float', value: 0 },
+        /**
+         * This buffer's UV -> the UV the same world point had in the last
+         * frame's buffer: last frame's camera composed with this one's inverse,
+         * as the two rows of a 2x3 affine. Rows rather than a mat3 because that
+         * is two dot products, and because the buffers are snapped onto a
+         * lattice -- the camera moves in whole texels, so the offset carries
+         * jumps the scale part knows nothing about.
+         */
+        uReprojX: { type: 'vec2', value: f32(2) },
+        uReprojY: { type: 'vec2', value: f32(2) },
+        uReprojT: { type: 'vec2', value: f32(2) },
+    });
+
+    return p.build({
+        vertex: fullscreen,
+        fragment: () => {
+            const cur = current.sample(uv).toVar();
+            const back = vec2(dot(uv, u.uReprojX), dot(uv, u.uReprojY)).add(u.uReprojT).toVar();
+            const hist = history.sample(back).toVar();
+
+            const lumC = dot(cur.rgb, LUMA).toVar();
+            const lumH = dot(hist.rgb, LUMA).toVar();
+            const diff = abs(lumH.sub(lumC)).div(lumC.add(lumH).add(1e-6));
+            // Off the buffer there is no history -- the world that just panned
+            // into the margin was never resolved. Clamped sampling would hand
+            // back the edge texel instead, which is a different place.
+            const onBuffer = step(0, back.x)
+                .mul(step(back.x, 1))
+                .mul(step(0, back.y))
+                .mul(step(back.y, 1));
+            const keep = u.uKeep.mul(onBuffer).mul(float(1).sub(smoothstep(REJECT_FROM, REJECT_TO, diff)));
+            return mix(cur, hist, keep);
+        },
+    });
+}
 
 /**
  * Shade the albedo with the resolved fluence. Rendered straight into the scene

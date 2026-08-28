@@ -3,7 +3,15 @@ import type { ColorSource, Container, Renderer, Shader, WebGLRenderer } from 'pi
 import { patchRenderer, setTexture } from 'pixi-psl';
 import { Pass } from './pass';
 import { SceneCollector } from './material';
-import { compositeShader, extendShader, mergeShader, resolveShader, seedShader, smoothShader } from './shaders';
+import {
+    compositeShader,
+    extendShader,
+    mergeShader,
+    resolveShader,
+    seedShader,
+    smoothShader,
+    temporalShader,
+} from './shaders';
 import { buildLayout, raysWidth, snapStep } from './cascades';
 import type { HrcLayout } from './cascades';
 import type { GpuProfiler } from './profile';
@@ -64,6 +72,27 @@ export interface RadianceCascadesOptions {
      * @default 1
      */
     smoothing?: number;
+    /**
+     * How much of last frame's light to keep, `0` to `0.98`. `0`, the default,
+     * is off and costs nothing.
+     *
+     * What is left in the image once `smoothing` has taken the lattice is
+     * *temporal*: the cascades resolve from a ray fan that lands on different
+     * texels whenever the camera moves under it, so a lit wall shimmers while
+     * nothing in the scene moves. No spatial filter reaches that -- it is the
+     * light itself moving -- but averaging the field with the frame before it
+     * does, which is what this is: an exponential moving average over the
+     * resolved fluence, reprojected through the camera so panning and zooming
+     * do not smear it.
+     *
+     * `0.85` is a good place to start; `0.95` is very smooth and starts to lag
+     * lights that move slowly enough not to trip the agreement test that keeps
+     * real changes -- an explosion, a light switching on -- responsive. Costs
+     * one `extent^2` RGBA16F buffer and one fullscreen pass, both only while it
+     * is above `0`.
+     * @default 0
+     */
+    temporal?: number;
     /**
      * World kept outside the view that still emits and occludes, as a **fraction
      * of the view** on each side. Rays travel through it, so a torch a little
@@ -152,6 +181,8 @@ export class RadianceCascades {
     toneMap: boolean;
     /** How many plane-lattice harmonics to filter out of the light, `0` to `3`. */
     smoothing: number;
+    /** How much of last frame's reprojected light to keep, `0` to `0.98`. `0` is off. */
+    temporal: number;
 
     /** How far into an occluder light reaches, in world pixels. */
     occluderLightRange: number;
@@ -237,12 +268,25 @@ export class RadianceCascades {
      * nonzero, so a pipeline that never smooths never pays for it.
      */
     private _fluenceScratch: RenderTexture | null = null;
+    /**
+     * Last frame's resolved fluence, for {@link RadianceCascades.temporal} to
+     * average this one against -- the same size, format and mip chain as
+     * `_fluence`, because the two swap roles every frame. Made the first time
+     * `temporal` is nonzero, so a pipeline that never accumulates never pays
+     * for it.
+     */
+    private _fluencePrev: RenderTexture | null = null;
+    /** The GI camera the fluence in `_fluencePrev` was resolved through. */
+    private readonly _prevGi = new Matrix();
+    /** This buffer's pixels -> last frame's, from those two. Scratch for one frame. */
+    private readonly _reproj = new Matrix();
 
     private readonly _seedPass: Pass;
     private readonly _extendPass: Pass;
     private readonly _mergePass: Pass;
     private readonly _resolvePass: Pass;
     private readonly _smoothPass: Pass;
+    private readonly _temporalPass: Pass;
 
     private _destroyed = false;
 
@@ -262,6 +306,7 @@ export class RadianceCascades {
         this.emissiveBoost = options.emissiveBoost ?? 1;
         this.toneMap = options.toneMap ?? true;
         this.smoothing = options.smoothing ?? 1;
+        this.temporal = options.temporal ?? 0;
         this.ambient = options.ambient ?? 0x000000;
         this.occluderAmbient = options.occluderAmbient ?? 0x000000;
         this.occluderLightRange = options.occluderLightRange ?? 256;
@@ -276,6 +321,7 @@ export class RadianceCascades {
         // than each getting its own for a final four-tap sum.
         this._resolvePass = new Pass(resolveShader(), 'add');
         this._smoothPass = new Pass(smoothShader());
+        this._temporalPass = new Pass(temporalShader());
 
         this.view = new Mesh<Geometry, Shader>({
             geometry: new Geometry({
@@ -412,9 +458,11 @@ export class RadianceCascades {
         this._mergePass.setTexture('uRays', this._rays[0]!.source);
         this._mergePass.setTexture('uCones', this._coneA.source);
         this._resolvePass.setTexture('uCones', this._coneA.source);
-        // The scratch buffer is sized off `extent` too, so it goes with the rest
-        // and is remade at the new size the next time smoothing asks for it.
+        // The scratch and history buffers are sized off `extent` too, so they go
+        // with the rest and are remade at the new size the next time smoothing
+        // or temporal accumulation asks for them.
         this._fluenceScratch = null;
+        this._fluencePrev = null;
         this._smoothPass.setTexture('uFluence', this._fluence.source);
 
         for (const rt of stale) rt?.destroy(true);
@@ -529,15 +577,30 @@ export class RadianceCascades {
         // one carrying mips -- so an odd number of passes resolves into the
         // scratch buffer and an even number straight into `_fluence`.
         const smoothing = this._smoothing();
-        const resolveTarget = smoothing % 2 === 1 ? this._fluenceScratch! : this._fluence;
+        const keep = this._temporal();
+        // Where the resolve and the filter chain have to leave the raw field.
+        // Accumulating means it is an *input* to one more pass rather than the
+        // frame's answer, so it lands in the scratch and `_fluence` is left
+        // holding last frame's answer for that pass to read.
+        const end = keep > 0 ? this._fluenceScratch! : this._fluence;
+        const spare = keep > 0 ? this._fluencePrev! : this._fluenceScratch!;
+        const resolveTarget = smoothing % 2 === 1 ? spare : end;
         profiler?.begin('hrc');
         for (let i = this.repeat['hrc'] ?? 1; i > 0; i--) this._renderCascades(resolveTarget);
         // No `repeat` key: every pass here reads what the one before it wrote, so
         // running the chain twice would filter twice rather than repeat the work.
         if (smoothing > 0) {
             profiler?.begin('smooth');
-            this._smooth(smoothing);
+            this._smooth(smoothing, resolveTarget, resolveTarget === end ? spare : end);
         }
+        if (keep > 0) {
+            profiler?.begin('temporal');
+            this._accumulate(keep, end);
+        }
+        // The camera the fluence the composite is about to read was resolved
+        // through -- next frame's reprojection, and copied whether or not it is
+        // accumulating, so turning `temporal` on mid-frame has one to work from.
+        this._prevGi.copyFrom(m);
         // The occluder surface light is a mip tap of the fluence, so the chain has
         // to be rebuilt after the resolve. One 512^2 RGBA16F reduction.
         this._fluence.source.updateMipmaps();
@@ -647,24 +710,49 @@ export class RadianceCascades {
      */
     private _smoothing(): number {
         const passes = Math.max(0, Math.min(MAX_SMOOTHING, Math.round(this.smoothing)));
-        if (passes > 0 && !this._fluenceScratch) {
-            const { extent } = this._layout;
-            this._fluenceScratch = createTarget(extent, extent, 'rgba16float', 'linear');
-        }
+        if (passes > 0) this._scratch();
         return passes;
     }
 
     /**
+     * History weight for this frame, clamped, and the buffers it needs. Like
+     * {@link _smoothing}, this is where the allocation happens because
+     * `temporal` is a live field: switching it on costs one more mipmapped
+     * `extent^2` RGBA16F buffer plus the scratch, and leaving it at `0` costs
+     * nothing at all.
+     *
+     * Not quite `1`: at `1` the field would be whatever the first frame
+     * resolved, for ever.
+     */
+    private _temporal(): number {
+        const keep = Math.max(0, Math.min(MAX_TEMPORAL, this.temporal));
+        if (keep > 0 && !this._fluencePrev) {
+            const { extent } = this._layout;
+            // Mipmapped like `_fluence`: the two swap every frame, so whichever
+            // one holds the answer is the one the composite dilates.
+            this._fluencePrev = createTarget(extent, extent, 'rgba16float', 'linear', true);
+            this._scratch();
+        }
+        return keep;
+    }
+
+    /** The un-mipmapped spare buffer, shared by the filter chain and the accumulation. */
+    private _scratch(): RenderTexture {
+        const { extent } = this._layout;
+        return (this._fluenceScratch ??= createTarget(extent, extent, 'rgba16float', 'linear'));
+    }
+
+    /**
      * The lattice filter -- one pass per period, two lighting pixels then four
-     * then eight, ping-ponged between the two fluence buffers. See
+     * then eight, ping-ponged between the pair of buffers it is handed and
+     * finishing in whichever of them the caller wants the field. See
      * {@link smoothShader} for what is being nulled and why it can be.
      */
-    private _smooth(passes: number): void {
+    private _smooth(passes: number, from: RenderTexture, into: RenderTexture): void {
         const { extent } = this._layout;
         const u = this._smoothPass.resources['smoothUniforms'].uniforms;
-        const odd = passes % 2 === 1;
-        let read = odd ? this._fluenceScratch! : this._fluence;
-        let write = odd ? this._fluence : this._fluenceScratch!;
+        let read = from;
+        let write = into;
         for (let i = 0; i < passes; i++) {
             // A quarter of the period this pass nulls: half a texel, then one, then two.
             const tap = 2 ** (i - 1) / extent;
@@ -673,6 +761,38 @@ export class RadianceCascades {
             this._smoothPass.run(this._renderer, write);
             [read, write] = [write, read];
         }
+    }
+
+    /**
+     * Average `current` into the light the last frame resolved, and make the
+     * result the buffer the composite reads.
+     *
+     * The history is the *world*'s light, held in a buffer that is pinned to
+     * the camera, so it has to be read through where each pixel used to be:
+     * `_reproj` is last frame's camera composed with the inverse of this one's,
+     * both of them the transform the buffers were actually rasterised with --
+     * lattice snap, margin and all -- so the reprojection is exact rather than
+     * a per-frame guess at a camera delta.
+     *
+     * The two mipmapped buffers then swap: what was just written is this
+     * frame's answer and next frame's history, and what the composite was
+     * reading becomes the spare. One pass, no copies.
+     */
+    private _accumulate(keep: number, current: RenderTexture): void {
+        const { extent } = this._layout;
+        const u = this._temporalPass.resources['temporalUniforms'].uniforms;
+        const r = this._reproj.copyFrom(this._giTransform).invert().prepend(this._prevGi);
+        u['uKeep'] = keep;
+        setVec2(u['uReprojX'], r.a, r.c);
+        setVec2(u['uReprojY'], r.b, r.d);
+        // The rows are in buffer pixels and the shader works in UV; the linear
+        // part is a ratio of the two and carries over untouched.
+        setVec2(u['uReprojT'], r.tx / extent, r.ty / extent);
+        this._temporalPass.setTexture('uCurrent', current.source);
+        this._temporalPass.setTexture('uHistory', this._fluence.source);
+        this._temporalPass.run(this._renderer, this._fluencePrev!);
+        [this._fluence, this._fluencePrev] = [this._fluencePrev!, this._fluence];
+        setTexture(this.view.shader!, 'uFluence', this._fluence.source);
     }
 
     /**
@@ -700,6 +820,7 @@ export class RadianceCascades {
         this._mergePass.destroy();
         this._resolvePass.destroy();
         this._smoothPass.destroy();
+        this._temporalPass.destroy();
         this.view.destroy({ children: true });
         this._disposeTargets();
     }
@@ -717,6 +838,7 @@ export class RadianceCascades {
             this._coneB,
             this._fluence,
             this._fluenceScratch,
+            this._fluencePrev,
         ];
     }
 
@@ -726,6 +848,7 @@ export class RadianceCascades {
         this._emissiveHi = null;
         this._occlusionHi = null;
         this._fluenceScratch = null;
+        this._fluencePrev = null;
     }
 }
 
@@ -735,6 +858,12 @@ export class RadianceCascades {
  * side, by which point it is the light being filtered and not the lattice.
  */
 const MAX_SMOOTHING = 3;
+
+/**
+ * Ceiling on {@link RadianceCascadesOptions.temporal}. At `1` the average never
+ * takes a new sample and the light is whatever the first frame resolved.
+ */
+const MAX_TEMPORAL = 0.98;
 
 function createTarget(
     width: number,
